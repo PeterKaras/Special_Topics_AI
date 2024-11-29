@@ -27,14 +27,15 @@ class RandomCartPoleEnv(gym.Env[np.ndarray, Union[int, np.ndarray]]):
         "render_fps": 50,
     }
 
-    def __init__(self,sutton_barto_reward: bool = False, render_mode: Optional[str] = None, seed:int=0, random_var:rv_continuous=uniform()):
+    def __init__(self,sutton_barto_reward: bool = False, render_mode: Optional[str] = None, seed:int=0, random_vars:Tuple[rv_continuous]=(uniform(),)):
         """The random variable might make some environments unstable, so be careful with the random variable you choose, we try to constrict it to a space, where the environment is still solvable.
         We try to keep the means equal to the original values, which means some values which are important for rendering are not touched, like x_threshold.
         
         When a seed other than 0 is given, it is used to seed the random variable. Otherwise the random variable is seeded via system logic."""
-        self.random_var = random_var
+        self.random_var = random_vars[0]
+        rng = np.random.default_rng(seed if seed != 0 else None)
         def seed()->float: 
-            return self.random_var.rvs(random_state=(None if seed==0 else seed)) - 0.5 #The seed is a float in [-0.5,0.5]
+            return self.random_var.rvs(random_state=rng) - 0.5 #The seed is a float in [-0.5,0.5]
 
         self._sutton_barto_reward = sutton_barto_reward
 

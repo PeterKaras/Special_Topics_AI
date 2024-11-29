@@ -4,7 +4,7 @@ We introduce at least one new random variable per environment'''
 import gymnasium as gym
 
 from collections import deque, OrderedDict
-from typing import Generator, Tuple
+from typing import Generator, Tuple, Any, Optional, Type
 from scipy.stats import rv_continuous, uniform
 import numpy as np
 
@@ -36,6 +36,18 @@ class EnvSet(Generator):
         self.random_vars = random_vars
         self.kwargs = kwargs
     
-    def sample(self, seed:int):
-        return gym.make(self.id, seed, *self.random_vars, **self.kwargs)
+    def sample(self, seed:Optional[int]=None) -> gym.Env:#
+        if seed is None:
+            seed = np.random.random_integers(2^31-1)
+        if self.id not in possible_envs:
+            return gym.make(self.id, seed=seed, **self.kwargs)
+        else:
+            return gym.make(self.id, seed=seed, random_vars=self.random_vars, **self.kwargs)
+
+    def send(self, value: None) -> Any:
+        return super().send(value)
+    
+
+    def throw(self, typ: Optional[Type] = None, val: Optional[BaseException] = None, tb: Optional[Any] = None) -> None:
+        return super().throw(typ, val, tb)
 

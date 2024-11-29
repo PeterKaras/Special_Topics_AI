@@ -5,14 +5,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import gymnasium as gym
+from gymnasium.core import Env
 from collections import deque, OrderedDict
 from tqdm import tqdm
 
-from typing import Dict, Optional, Callable, List, Generator, Tuple, Literal, overload
+from typing import Dict, Optional, Callable, List, Generator, Tuple, Literal, overload, Any
 import math
 
 from env_sets import EnvSet, possible_envs
 from scipy.stats import norm, uniform
+
+import wandb
 
 class QNetwork(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=256, layers=3):
@@ -52,9 +55,9 @@ class MemoryBuffer:
         """
         if len(self.buffer) >= self.max_size:
             self.buffer.pop(0)
-        self.buffer.append(experience)
+        self.buffer.append(tuple(torch.tensor(e) if type(e)!=torch.Tensor else e for e in experience))
     
-    def sample(self, batch_size:int, pop:bool=False)->List[Tuple[torch.Tensor, List[int], int, float, torch.Tensor, bool]]:
+    def sample(self, batch_size:int, pop:bool=False)->List[Tuple[torch.Tensor, torch.IntTensor, torch.IntTensor, torch.FloatTensor, torch.Tensor, torch.BoolTensor]]:
         """Samples a batch of experiences from the memory buffer. The experience is a tuple of the
             - state, 
             - the alpha-beta values
@@ -75,7 +78,7 @@ class RLTask:
         self.test_set:List[int] = [i for i in range(math.ceil(episodes*portion_test), episodes)]
 
     
-    def train_sample(self)->Generator[Tuple[gym.Env, gym.ObsState], None, None]:
+    def train_sample(self)->Generator[Tuple[Env, Any], None, None]:
         """Samples the environment of the task.
             For that it resets the environment with a new seed, and returns the environment and the initial state.
         """
@@ -83,7 +86,7 @@ class RLTask:
             state, _ = self.env.reset(seed=task)
             yield self.env, state
 
-    def test_sample(self)->Generator[Tuple[gym.Env, gym.ObsState], None, None]:
+    def test_sample(self)->Generator[Tuple[Env, Any], None, None]:
         """Samples the environment of the task.
             For that it resets the environment with a new seed, and returns the environment and the initial state.
         """
@@ -95,10 +98,10 @@ def generate_task(env:gym.Env, episodes:int=10, portion_test:float=0.5)->RLTask:
     return RLTask(env, episodes, portion_test)
 
 class MetaNet():
-    def __init__(self, state_dim:int, action_dim:int, hidden_dim:int=256, layers:int=3, 
-        meta_lr:float=0.01, meta_min_lr:float=0.0001, num_task_batches:int=1000, use_second_order:bool=False,
-        gamma:float=0.99, lossFn:Callable=nn.SmoothL1Loss, inner_lr:float=0.0001, heuristic_update_inner_lr:bool=False, 
-        num_steps:int=500, update_rate:int=32, batch_size:int=64, memory_size:int=10000,
+    def __init__(self, state_dim:int, action_dim:int, hidden_dim:int=64, layers:int=3, 
+        meta_lr:float=0.001, meta_min_lr:float=0.0001, num_task_batches:int=1000, use_second_order:bool=False,
+        gamma:float=0.99, lossFn:Callable=nn.SmoothL1Loss, inner_lr:float=0.001, heuristic_update_inner_lr:bool=False, 
+        num_steps:int=500, update_rate:int=8, batch_size:int=32, memory_size:int=10000,
         initial_alpha=1.0, initial_beta=1.0, useMetaSampling:bool=False,
         inner_grad_clip:float=100.0, meta_grad_clip:float=15.0,
         device="auto"
@@ -117,21 +120,23 @@ class MetaNet():
             The learning rate of the meta-net. 
         meta_min_lr: float = 0.0001
             The minimum learning rate of the meta-net, used for the CosineAnnealingLR scheduler.
-        num_task_batches: int = 100
+        num_task_batches: int = 1000
             The total number of task batches that are learned. "Just like an episode".
         use_second_order: bool = False
         gamma: float = 0.99
             The discount factor.
         lossFn: Callable = nn.SmoothL1Loss
-        inner_lr: float = 0.0001
+        inner_lr: float = 0.005
             The learning rate of the inner-net. 
         heuristic_update_inner_lr: bool = False
             Whether to use the heuristic to update the inner-net learning rate or not.
             The heuristic is that the inner lr should depend on the outer lr by some factor. This makes sure that while the outer net progresses, the inner net does not overshoot with too high learning rates, but still learns fast in the beginning. #TODO implement inner lr heuristic
         num_steps: int = 500
             The number of steps to take in each environment pass. How many environment passes are done is determined by how many are given in the RLTask.
-        update_rate: int = 32
+        update_rate: int = 8
             The number of steps before the inner-net is updated. Should be <= batch_size so that each batch can be used multiple times for the inner-net update. Batch contents are drawn randomly from the memory.
+        batch_size: int = 32
+            The size of the batch for the inner-net update.
         memory_size: int = 10000
             The size of the memory buffer.
         initial_alpha: float = 1.0 
@@ -165,6 +170,8 @@ class MetaNet():
         
         self.use_second_order = use_second_order #whether to allow second order gradients to be build up
 
+        self.penalty_factor = 0.1
+
         #inner learning params
         self.useMetaSampling = useMetaSampling
         self.lossfn = lossFn
@@ -193,15 +200,15 @@ class MetaNet():
             self.device = torch.device(device)
 
         if self.useMetaSampling:
-            self.inner_q_net = QNetwork(state_dim + 2*action_dim, action_dim).to(self.device)
+            self.inner_q_net = QNetwork(state_dim + 2*action_dim, action_dim, hidden_dim=self.hidden_dim, layers=layers).to(self.device)
             
-            self.meta_q_net = QNetwork(state_dim + 2*action_dim, action_dim).to(self.device)
+            self.meta_q_net = QNetwork(state_dim + 2*action_dim, action_dim, hidden_dim=self.hidden_dim, layers=layers).to(self.device)
             self.meta_optimizer = optim.Adam(self.meta_q_net.parameters(), lr=self.meta_lr)
             
         else:
-            self.inner_q_net = QNetwork(state_dim, action_dim, hidden_dim, layers).to(self.device)
+            self.inner_q_net = QNetwork(state_dim, action_dim, self.hidden_dim, layers).to(self.device)
 
-            self.meta_q_net = QNetwork(state_dim, action_dim, hidden_dim, layers).to(self.device)
+            self.meta_q_net = QNetwork(state_dim, action_dim, self.hidden_dim, layers).to(self.device)
             self.meta_optimizer = optim.Adam(self.meta_q_net.parameters(), lr=self.meta_lr)
 
         self.meta_q_net.load_state_dict(self.inner_q_net.state_dict())
@@ -229,7 +236,7 @@ class MetaNet():
             factor = self.meta_lr / self.inner_lr
         return self.meta_lr_scheduler.get_lr()[0] * factor
 
-    def inner_update(self, pop_buffer:bool, ret_gradient_ptr:Optional[List[torch.Tensor]]=None):
+    def inner_update(self, pop_buffer:bool, ret_gradient_ptr:Optional[List[torch.Tensor]]=None, apply_update:bool=True)->torch.Tensor:
         """Updates the inner-net based on the memory buffer.
         
         This function combines the loss calculation and the inner update"""
@@ -260,7 +267,7 @@ class MetaNet():
             else:
                 next_state_values[non_final_mask] = self.meta_q_net(non_final_next_states).max(1).values 
 
-        expected_state_action_values = rewards + ((1-dones) * self.gamma * next_state_values) 
+        expected_state_action_values = rewards + ((~dones) * self.gamma * next_state_values) 
 
         # compute loss
         loss = self.lossfn()(state_action_values, expected_state_action_values)
@@ -272,7 +279,8 @@ class MetaNet():
 
         grads = tuple(grad.clamp(-self.inner_grad_clip, self.inner_grad_clip) for grad in grads)
         #apply the new weights with an SGD step to the inner-net
-        self.inner_q_net.load_state_dict({name: param - self.inner_lr * grad for ((name, param), grad) in zip(weights.items(), grads)})
+        if apply_update:
+            self.inner_q_net.load_state_dict({name: param - self.inner_lr * grad for ((name, param), grad) in zip(weights.items(), grads)})
 
         if ret_gradient_ptr !=None:
             ret_gradient_ptr.append(grads) #just append the gradients to the list, we can access the list like a pointer to the next empty element in the buffer
@@ -316,35 +324,36 @@ class MetaNet():
             1.0 - ((n_losses - 1) * min_value_for_non_final_losses))
         loss_weights[-1, -1] = curr_value
         #retransform into list
-        loss_weights_list = [loss_weights[i, :task_losses[i]] for i in range(len(task_losses))]
+        loss_weights_list = [torch.tensor(loss_weights[i, :task_losses[i]]).to(self.device) for i in range(len(task_losses))]
         return loss_weights_list
 
 
     def meta_update(self, tasks:List[RLTask], test_task_losses:List[torch.Tensor], train_task_gradients:List[torch.Tensor])->float:
-        """Updates the meta-net based on the rewards of the inner net. The loss is calculated as the mean squared error between the q-values of the meta-net and the inner-net. The q-values are calculated by the inner-net and the meta-net is updated to predict the q-values of the inner-net."""
+        """Updates the meta-net parameters based on the test task losses"""
         #get the importances of all the train losses to the total test loss
-        loss_weights = self.compute_importances([len(task.train_set)*(self.num_steps/self.inner_update_rate) for task in tasks])
+        loss_weights = self.compute_importances([l.size(0) for l in test_task_losses])
 
-        meta_gradient = torch.zeros_like(self.meta_q_net.parameters())
+        # meta_gradient = [torch.zeros_like(param) for param in self.meta_q_net.parameters()]
 
-        total_test_loss = torch.tensor(0.0).to(self.device)
-        for task_loss, task_weight in zip(test_task_losses, loss_weights):
-            total_test_loss += torch.sum(task_weight * task_loss)
-            
-        task_loss.backward() #this should be the 2nd order gradient for the meta-net
-
-        #compute the task meta gradients
-        for meta_param, task_grad in zip(self.meta_q_net.parameters(), train_task_gradients):
-            meta_gradient += meta_param.grad * task_grad
-
-        meta_gradient /= len(tasks)
+        total_test_loss = torch.sum(torch.stack(list(torch.sum(task_weight * task_loss) for task_weight, task_loss in zip(loss_weights, test_task_losses))))
+        total_test_loss /= len(tasks)
 
         self.meta_optimizer.zero_grad()
-        meta_gradient.backward()
+        total_test_loss.backward() #this should be the 2nd order gradient for the meta-net
+
+        #compute the task meta gradients
+        #use the train gradients to improve the meta gradients #TODO is this necessary? the right way? hurtful?
+        # for t,_ in enumerate(tasks):
+        #     for meta_grad, meta_param, task_grad in zip(meta_gradient, self.meta_q_net.parameters(), train_task_gradients[t]):
+        #         meta_grad += meta_param.grad * task_grad
+
+        # for meta_grad in meta_gradient:
+        #     meta_grad /= len(tasks)
+
         self.meta_optimizer.step()
 
 
-    def select_action(self, state:torch.Tensor)->np.intp:
+    def select_action(self, state:torch.Tensor)->torch.Tensor:
         """Selects an action based on the state. The action is selected by sampling from the q-values. And then selecting the action with the highest value. If the meta-sampling is used, the inner net also gets the alpha and beta values, otherwise we use thompson sampling and multiply the q-values with the sampled probabilities."""
         if self.useMetaSampling:
             #how do we regularize? 
@@ -363,11 +372,37 @@ class MetaNet():
         else:
             #thompson sampling and q-value prediction
             q_values = self.inner_q_net(state) 
-            sampled_values = [np.random.beta(self.alpha[i], self.beta[i]) for i in range(self.action_dim)]
-            sampled_values *= q_values.detach().cpu().numpy()
+            sampled_values = torch.tensor([np.random.beta(self.alpha[i], self.beta[i]) for i in range(self.action_dim)]).to(self.device) * q_values.detach()
         
-        return np.argmax(sampled_values)
+        return torch.argmax(sampled_values)
     
+    def penalize_termination(self, step:int)->torch.Tensor:
+        """Penalize the early termination of the episode, this is necessary to get the meta network to have a consistent loss available. Minimizing the penalty and the actual loss go hand in hand
+        
+        Args:
+        step: int = s
+            The step at which the episode was terminated.
+        
+        Returns:
+            torch.Tensor: The penalty for the termination."""
+
+        #based on the last action, we penalize the termination
+        #probably the 2nd best action should have been taken, so we penalize, by the square difference of the 2nd best and the best action
+
+        state, _, action, _, _, _ = self.memory.buffer[-1]
+        q_values = self.inner_q_net(state)
+        #normalize q_values to have a max of 1
+        q_values = q_values / q_values.abs().max()
+
+
+        scnd_best_action = torch.argsort(q_values, descending=True)[1]
+
+        penalty = (q_values[action] - q_values[scnd_best_action]).pow(2)
+
+        return (self.num_steps -step)/self.num_steps * penalty * self.penalty_factor
+
+
+
     @overload
     def inner_loop(self, task: RLTask, train:Literal[True]=True, ret_memory_ptr:Optional[MemoryBuffer]=None, ret_gradient_ptr:Optional[List[torch.Tensor]]=None)->Tuple[float, torch.Tensor]:
         pass
@@ -391,29 +426,27 @@ class MetaNet():
         Returns:
         - Tuple[float, torch.Tensor, List[torch.FloatTensor]|None]: the score and loss of the task, and if train==True the individual losses of the tasks batches.
         """
-        score:float = 0.0
-        total_loss:torch.Tensor = torch.tensor(0.0).to(self.device)
+        total_score:float = 0.0
 
-        losses:List[torch.Tensor] = []
+        indiv_losses:List[torch.Tensor] = []
 
         if train:
             self.reset_sampling()
         self.reset_memory()
 
         env_scores = []
+        env_losses = []
+        env_step = 0
         for env, init_state in (task.train_sample() if train else task.test_sample()):
             score = 0
-            env_step = 0
+            losses = []
             state = torch.tensor(init_state, dtype=torch.float32).to(self.device)
             for s in range(self.num_steps):
                 env_step += 1
                 #select action and do it
                 action = self.select_action(state) #uses the inner-net to select the action
-                next_state, reward, terminated, truncated = env.step(action) #take the action in the environment
+                next_state, reward, terminated, truncated, _ = env.step(action.numpy()) #take the action in the environment
                 next_state = torch.tensor(next_state, dtype=torch.float32).to(self.device)
-
-                #store the experience and update sampling and the net if necessary
-                self.memory.append((state, action, reward, next_state, terminated)) #store the experience
 
                 #only do the updating if we are in the training phase
                 if train:
@@ -422,31 +455,43 @@ class MetaNet():
                     else:
                         self.beta[action] += 1  # Unsuccessful actions increase beta
 
-                if train:
-                    if env_step>self.batch_size and s % self.inner_update_rate == 0:
-                        #update the inner-net, and pop the selected indices from the buffer if we have enough samples: 3x the batch size in the current buffer
-                        batch_loss = self.inner_update(
-                            pop_buffer = (
-                                env_step - (self.batch_size*env_step/self.inner_update_rate) 
-                                > 3*self.batch_size
-                            ), 
-                            ret_gradient_ptr=ret_gradient_ptr
-                        )
-                        total_loss += batch_loss
-                        losses.append(batch_loss)
+                #store the experience and update sampling and the net if necessary
+                self.memory.append((state, [e for e in self.alpha+self.beta], action, reward, next_state, terminated)) #store the experience
+
+                #when enough in the memory buffer, and in an update round, make the gradients and possibly update the inner-net 
+                # or during testing, just get the gradients each round.
+                if env_step>=self.batch_size and ((env_step % self.inner_update_rate == 0) or not train):
+                    #update the inner-net, and pop the selected indices from the buffer if we have enough samples: 3x the batch size in the current buffer
+                    batch_loss = self.inner_update(
+                        pop_buffer = (
+                            env_step - (self.batch_size*env_step/self.inner_update_rate) 
+                            > 3*self.batch_size
+                        ), 
+                        ret_gradient_ptr=ret_gradient_ptr,
+                        apply_update=train
+                    )
+                    losses.append(batch_loss*self.inner_update_rate)
+                    indiv_losses.append(batch_loss*self.inner_update_rate)
 
                 #prepare for the next step
                 state = next_state
                 score += reward
-                if terminated or truncated:
+                if terminated:#penalize the agent for terminating the episode
+                    penalty = self.penalize_termination(step=s)
+                    break
+                if truncated:
                     break
 
             env_scores.append(score)
+            env_losses.append(torch.stack(losses).sum() if len(losses) > 0 else torch.tensor(500).to(self.device))
 
             if ret_memory_ptr is not None:
                 ret_memory_ptr.buffer = deepcopy(self.memory.buffer)
 
-        return (score, total_loss) if train else (score, total_loss, torch.tensor(losses).to(self.device))
+        total_score = sum(env_scores)
+        if len(indiv_losses) == 0:
+            raise RuntimeError("No losses were computed. Increase the number of episodes per environment.")
+        return (total_score, torch.stack(env_losses).mean()) if train else (score, torch.stack(env_losses).mean(), torch.stack(indiv_losses))
         
     def meta_learn(self, task:RLTask|List[RLTask])->Tuple[float, float]:
         """This function should be used to learn the meta-net. It should return the average score of the tasks, and the average loss of the tasks.
@@ -466,9 +511,11 @@ class MetaNet():
             tasks = task
 
         #first make some new memories on the test data
-        test_memories = [MemoryBuffer(self.memory_size) for _ in range(len(tasks))]
+        # test_memories = [MemoryBuffer(self.memory_size) for _ in range(len(tasks))]
         indiv_test_losses:List[torch.FloatTensor] = [None for _ in range(len(tasks))]
         train_gradients = [] #empty list, we append to it in the inner-loop, use it like a pointer
+        test_reward = 0
+        test_loss = torch.tensor(0.0).to(self.device)
 
         for t, __task in enumerate(tasks):
             #reset the inner-net to the meta-net
@@ -478,16 +525,16 @@ class MetaNet():
             task_train_score, task_train_loss  = self.inner_loop(__task, train=True, ret_gradient_ptr=train_gradients) #train the inner-net
             
             #this is the query phase
-            task_test_score, task_test_loss, indiv_test_losses[t] = self.inner_loop(__task, train=False, ret_memory_ptr=test_memories[t])
+            task_test_score, task_test_loss, indiv_test_losses[t] = self.inner_loop(__task, train=False)
             test_reward += task_test_score
-            test_loss += task_test_loss
+            test_loss += task_test_loss / len(indiv_test_losses[t])
 
             __task.env.close()
 
         #and now we learn the meta-net, for this we bascially do the same as above but this time don't update the alpha/beta and the inner-net
         #and then we update the meta-net based on the rewards of the inner-net given the prior weights it got from the meta net
-        test_reward, test_loss = self.meta_update(tasks, test_task_losses=indiv_test_losses, train_task_gradients=train_gradients) #update the meta-net
-
+        self.meta_update(tasks, test_task_losses=indiv_test_losses, train_task_gradients=train_gradients) #update the meta-net
+        test_reward /= len(tasks)
         return test_reward, test_loss
 
 
@@ -529,13 +576,17 @@ def learn_meta_net(env_name:str="RandomCartPole", n_tasks:int=1000, episodes:int
     kwargs: dict
         The keyword arguments to be passed to the MetaNet constructor. 
     """
+    if env_name not in possible_envs.keys():
+        print(f"Environment {env_name} not found in the meta environments. Assuming it is a normal gym environment.")
+
+    
     gym_env = gym.make(possible_envs[env_name])
     action_dim:int = gym_env.action_space.n
     state_dim:int = gym_env.observation_space.shape[0]
     gym_env.close()
     del gym_env
 
-    meta_net:MetaNet = MetaNet(state_dim, action_dim, num_tasks=1000, num_steps=n_steps, **kwargs) #total_epochs is task_iterations
+    meta_net:MetaNet = MetaNet(state_dim, action_dim, num_task_batches=n_tasks, num_steps=n_steps, **kwargs) #total_epochs is task_iterations
 
     envset = EnvSet(env_name, norm)
     train_task_set:List[RLTask] = [generate_task(envset.sample(), episodes=episodes, portion_test=0.5) for _ in range(n_tasks)]
@@ -544,15 +595,20 @@ def learn_meta_net(env_name:str="RandomCartPole", n_tasks:int=1000, episodes:int
     train_scores = []
     test_scores = []
 
-    #TODO find out whether it helps to pass multiple tasks per learning step
+    #wandb init
+    
+    wandb.init(project="meta-rl-thoml", config=kwargs|{"env_name": env_name, "n_tasks": n_tasks, "episodes": episodes, "n_steps": n_steps})
+
+    #TODO find out whether it helps to pass multiple tasks per learning step: doing a task_batch size > 1?
 
     #TODO find out whether we should see each task batch multiple times before going to the next task batch. See MAML++ code: https://github.com/AntreasAntoniou/HowToTrainYourMAMLPytorch/blob/master/few_shot_learning_system.py#L232. 
-    # Our current analog is that we sample from the environment many times. 
-
-    #TODO find out how an epoch should be defined. it normally is all the data again, but we have infinite data (environments),
+    # Our current analog is that we sample from the environment many times. But we could also think of this as seeing each task batch multiple times before seeing the next one.
     for t, task in tqdm(enumerate(train_task_set), desc="Training MetaNet"):
-        avg_score, _ = meta_net.meta_learn(task) #training epoch
+        avg_score, avg_loss = meta_net.meta_learn(task) #training epoch
         train_scores.append(avg_score)
+
+        #log to wandb
+        wandb.log({"meta_train_score": avg_score, "meta_train_loss": avg_loss})
 
         #simulate one episode
         meta_net.curr_task_batch += 1
@@ -560,8 +616,56 @@ def learn_meta_net(env_name:str="RandomCartPole", n_tasks:int=1000, episodes:int
 
     #here it does not makes sense to choose multiple tasks at the same time, as we want to see the generalization of the meta-net.
     for t, task in tqdm(enumerate(test_task_set), desc="Testing MetaNet"):
-        avg_score, _ = meta_net.meta_test(task) #testing
+        avg_score, avg_loss = meta_net.meta_test(task) #testing
         test_scores.append(avg_score)
+
+        #log to wandb
+        wandb.log({"meta_test_score": avg_score, "meta_test_loss": avg_loss})
     
     return meta_net, train_scores, test_scores
     
+
+def run_experiment():
+    #get the cmd line arguments
+    import argparse
+    parser = argparse.ArgumentParser(description="Run the meta-learning experiment.")
+    parser.add_argument("--env", type=str, default="RandomCartPole", help="The environment to be used.")
+    parser.add_argument("--n_tasks", type=int, default=1000, help="The number of tasks to be generated.")
+    parser.add_argument("--use_task_batches", type=bool, default=False, help="Whether to use task batches or not.")
+    parser.add_argument("--task_batch_size", type=int, default=10, help="The size of the task batches, only used if use_task_batches is True.")
+    parser.add_argument("--use_second_order", type=bool, default=True, help="Whether to use second order gradients or not.")
+    parser.add_argument("--num_episodes", type=int, default=300, help="The number of episodes to run each environment for.")
+    parser.add_argument("--num_steps", type=int, default=500, help="The number of steps to be done in each environment episode.")
+    parser.add_argument("--hpt", type=bool, default=False, help="Whether to use hyperparameter tuning or not. All not given, hyperparameters are searched for.")
+    parser.add_argument("--config", type=str, default="", help="The json-config file to be used for hyperparameter tuning. See the documentation for the format.")
+
+    args = parser.parse_args()
+
+    if args.hpt:
+        #TODO implement hyperparameter tuning
+        pass
+    
+    else:
+        if args.config != "":
+            #TODO implement config file reading
+            pass
+        #run the experiment
+        meta_net, train_scores, test_scores = learn_meta_net(
+            env_name=args.env, 
+            n_tasks=args.n_tasks, 
+            episodes=args.num_episodes, 
+            n_steps=args.num_steps, 
+            use_second_order=args.use_second_order
+        )
+
+        # plot the train and test scores
+        import matplotlib.pyplot as plt
+        plt.plot(train_scores, label="Train Scores")
+        plt.plot(test_scores, label="Test Scores")
+        plt.legend()
+        plt.show()
+
+
+if __name__ == "__main__":
+
+    run_experiment()

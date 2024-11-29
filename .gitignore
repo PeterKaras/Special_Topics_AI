@@ -2,4 +2,7 @@
 
 
 /pycache/
-.pyc
+*.pyc
+
+/wandb/
+/__pycache__/
