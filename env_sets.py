@@ -39,8 +39,9 @@ class EnvSet(Generator):
     def sample(self, seed:Optional[int]=None) -> gym.Env:#
         if seed is None:
             seed = np.random.random_integers(2^31-1)
+
         if self.id not in possible_envs:
-            return gym.make(self.id, seed=seed, **self.kwargs)
+            return gym.make(self.id, **self.kwargs)
         else:
             return gym.make(self.id, seed=seed, random_vars=self.random_vars, **self.kwargs)
 
