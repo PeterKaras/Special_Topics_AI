@@ -99,9 +99,9 @@ def generate_task(env:gym.Env, episodes:int=10, portion_test:float=0.5)->RLTask:
 
 class MetaNet():
     def __init__(self, state_dim:int, action_dim:int, hidden_dim:int=64, layers:int=3, 
-        meta_lr:float=0.001, meta_min_lr:float=0.0001, num_task_batches:int=1000, use_second_order:bool=False,
-        gamma:float=0.99, lossFn:Callable=nn.SmoothL1Loss, inner_lr:float=0.001, heuristic_update_inner_lr:bool=False, 
-        num_steps:int=500, update_rate:int=8, batch_size:int=32, memory_size:int=10000,
+        meta_lr:float=0.00001, meta_min_lr:float=0.000001, num_task_batches:int=1000, use_second_order:bool=False,
+        gamma:float=0.99, lossFn:Callable=nn.SmoothL1Loss, inner_lr:float=0.0001, heuristic_update_inner_lr:bool=False, 
+        tau:float=0.001, num_steps:int=500, update_rate:int=8, batch_size:int=32, memory_size:int=10000,
         initial_alpha=1.0, initial_beta=1.0, useMetaSampling:bool=False,
         inner_grad_clip:float=100.0, meta_grad_clip:float=15.0,
         device="auto"
@@ -131,6 +131,8 @@ class MetaNet():
         heuristic_update_inner_lr: bool = False
             Whether to use the heuristic to update the inner-net learning rate or not.
             The heuristic is that the inner lr should depend on the outer lr by some factor. This makes sure that while the outer net progresses, the inner net does not overshoot with too high learning rates, but still learns fast in the beginning. #TODO implement inner lr heuristic
+        tau: float = 0.001
+            The tau parameter for the soft update of the target net.
         num_steps: int = 500
             The number of steps to take in each environment pass. How many environment passes are done is determined by how many are given in the RLTask.
         update_rate: int = 8
@@ -176,6 +178,7 @@ class MetaNet():
         self.useMetaSampling = useMetaSampling
         self.lossfn = lossFn
         self.inner_lr = inner_lr
+        self.tau = tau
 
         self.num_steps = num_steps
         self.inner_update_rate = update_rate
@@ -200,19 +203,21 @@ class MetaNet():
             self.device = torch.device(device)
 
         if self.useMetaSampling:
-            self.inner_q_net = QNetwork(state_dim + 2*action_dim, action_dim, hidden_dim=self.hidden_dim, layers=layers).to(self.device)
+            self.inner_target_net = QNetwork(state_dim + 2*action_dim, action_dim, hidden_dim=self.hidden_dim, layers=layers).to(self.device)
+            self.inner_policy_net = QNetwork(state_dim+2*action_dim, action_dim, self.hidden_dim, layers).to(self.device)
             
-            self.meta_q_net = QNetwork(state_dim + 2*action_dim, action_dim, hidden_dim=self.hidden_dim, layers=layers).to(self.device)
-            self.meta_optimizer = optim.Adam(self.meta_q_net.parameters(), lr=self.meta_lr)
+            self.meta_net = QNetwork(state_dim + 2*action_dim, action_dim, hidden_dim=self.hidden_dim, layers=layers).to(self.device)
             
         else:
-            self.inner_q_net = QNetwork(state_dim, action_dim, self.hidden_dim, layers).to(self.device)
+            self.inner_target_net = QNetwork(state_dim, action_dim, self.hidden_dim, layers).to(self.device)
+            self.inner_policy_net = QNetwork(state_dim, action_dim, self.hidden_dim, layers).to(self.device)
 
-            self.meta_q_net = QNetwork(state_dim, action_dim, self.hidden_dim, layers).to(self.device)
-            self.meta_optimizer = optim.Adam(self.meta_q_net.parameters(), lr=self.meta_lr)
-
-        self.meta_q_net.load_state_dict(self.inner_q_net.state_dict())
-
+            self.meta_net = QNetwork(state_dim, action_dim, self.hidden_dim, layers).to(self.device)
+            
+        self.inner_policy_net.load_state_dict(self.inner_target_net.state_dict())
+        self.meta_net.load_state_dict(self.inner_target_net.state_dict())
+        
+        self.meta_optimizer = optim.Adam(self.meta_net.parameters(), lr=self.meta_lr)
         self.meta_lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(self.meta_optimizer, T_max=self.num_task_batches, eta_min=self.meta_min_lr)
 
         #initialize the sampling
@@ -245,12 +250,12 @@ class MetaNet():
 
         #==q_values
         if self.useMetaSampling:
-            state_action_values = self.inner_q_net(torch.cat([
+            state_action_values = self.inner_policy_net(torch.cat([
                 torch.tensor([states]).to(self.device), 
                 torch.tensor([*list(ab.flatten())]).to(self.device)
             ])).gather(1, actions.unsqueeze(1)).squeeze(1) 
         else:
-            state_action_values = self.inner_q_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+            state_action_values = self.inner_policy_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
 
         #==target_q_values
         non_final_mask = torch.tensor(tuple(map(lambda s: s is not None, next_states)), dtype=torch.bool).to(self.device)
@@ -260,12 +265,12 @@ class MetaNet():
             if self.useMetaSampling:
                 # we should pass enhanced alpha, beta values to the inner-net, 
                 # but we just pass the same, as this most likely does not change much
-                next_state_values[non_final_mask] = self.inner_q_net(torch.cat([
+                next_state_values[non_final_mask] = self.inner_target_net(torch.cat([
                     torch.tensor([non_final_next_states]).to(self.device), 
                     torch.tensor([*list(ab.flatten())]).to(self.device)
                 ])).max(1).values
             else:
-                next_state_values[non_final_mask] = self.meta_q_net(non_final_next_states).max(1).values 
+                next_state_values[non_final_mask] = self.inner_target_net(non_final_next_states).max(1).values 
 
         expected_state_action_values = rewards + ((~dones) * self.gamma * next_state_values) 
 
@@ -273,14 +278,21 @@ class MetaNet():
         loss = self.lossfn()(state_action_values, expected_state_action_values)
 
         #from this part on it's basically https://github.com/AntreasAntoniou/HowToTrainYourMAMLPytorch/blob/master/few_shot_learning_system.py#L83
-        self.inner_q_net.zero_grad()
-        grads = torch.autograd.grad(loss, self.inner_q_net.parameters(), create_graph=self.use_second_order, allow_unused=True)
-        weights = self.inner_q_net.state_dict()
+        self.inner_policy_net.zero_grad()
+        grads = torch.autograd.grad(loss, self.inner_policy_net.parameters(), create_graph=self.use_second_order, allow_unused=True)
+        weights = self.inner_policy_net.state_dict()
 
         grads = tuple(grad.clamp(-self.inner_grad_clip, self.inner_grad_clip) for grad in grads)
         #apply the new weights with an SGD step to the inner-net
         if apply_update:
-            self.inner_q_net.load_state_dict({name: param - self.inner_lr * grad for ((name, param), grad) in zip(weights.items(), grads)})
+            self.inner_policy_net.load_state_dict({name: param - self.inner_lr * grad for ((name, param), grad) in zip(weights.items(), grads)})
+
+            #also update the target net
+            policy_state_dict = self.inner_policy_net.state_dict()
+            target_state_dict = self.inner_target_net.state_dict()
+
+            for key in target_state_dict.keys():
+                target_state_dict[key] = policy_state_dict[key]*self.tau + target_state_dict[key]*(1-self.tau)
 
         if ret_gradient_ptr !=None:
             ret_gradient_ptr.append(grads) #just append the gradients to the list, we can access the list like a pointer to the next empty element in the buffer
@@ -333,7 +345,7 @@ class MetaNet():
         #get the importances of all the train losses to the total test loss
         loss_weights = self.compute_importances([l.size(0) for l in test_task_losses])
 
-        # meta_gradient = [torch.zeros_like(param) for param in self.meta_q_net.parameters()]
+        # meta_gradient = [torch.zeros_like(param) for param in self.meta_net.parameters()]
 
         total_test_loss = torch.sum(torch.stack(list(torch.sum(task_weight * task_loss) for task_weight, task_loss in zip(loss_weights, test_task_losses))))
         total_test_loss /= len(tasks)
@@ -359,7 +371,7 @@ class MetaNet():
             #how do we regularize? 
             # -> for large alpha and beta, it should be close to the thompson sampling, as this is the optimal policy
             # -> for low alpha and beta, it does not need to be close as we want the meta-learning to have an effect
-            sampled_values = self.inner_q_net(torch.cat([
+            sampled_values = self.inner_policy_net(torch.cat([
                 torch.tensor([state]).to(self.device), 
                 torch.tensor(self.alpha, dtype=torch.float32).to(self.device), 
                 torch.tensor(self.beta, dtype=torch.float32).to(self.device)
@@ -371,7 +383,7 @@ class MetaNet():
             
         else:
             #thompson sampling and q-value prediction
-            q_values = self.inner_q_net(state) 
+            q_values = self.inner_policy_net(state) 
             sampled_values = torch.tensor([np.random.beta(self.alpha[i], self.beta[i]) for i in range(self.action_dim)]).to(self.device) * q_values.detach()
         
         return torch.argmax(sampled_values)
@@ -389,8 +401,14 @@ class MetaNet():
         #based on the last action, we penalize the termination
         #probably the 2nd best action should have been taken, so we penalize, by the square difference of the 2nd best and the best action
 
-        state, _, action, _, _, _ = self.memory.buffer[-1]
-        q_values = self.inner_q_net(state)
+        state, ab, action, _, _, _ = self.memory.buffer[-1]
+        if self.useMetaSampling:
+            q_values = self.inner_policy_net(torch.cat([
+                torch.tensor([state]).to(self.device), 
+                torch.tensor([*list(ab.flatten())]).to(self.device)
+            ])).squeeze(0)
+        else:
+            q_values = self.inner_policy_net(state)
         #normalize q_values to have a max of 1
         q_values = q_values / q_values.abs().max()
 
@@ -519,7 +537,8 @@ class MetaNet():
 
         for t, __task in enumerate(tasks):
             #reset the inner-net to the meta-net
-            self.inner_q_net.load_state_dict(self.meta_q_net.state_dict())
+            self.inner_policy_net.load_state_dict(self.meta_net.state_dict())
+            self.inner_target_net.load_state_dict(self.meta_net.state_dict())
 
             #this is basically support phase (== adaption during meta-training)
             task_train_score, task_train_loss  = self.inner_loop(__task, train=True, ret_gradient_ptr=train_gradients) #train the inner-net
@@ -549,7 +568,8 @@ class MetaNet():
         Tuple[float, float]: The average score of the tasks, and the average loss of the tasks.
         """
         #reset the inner-net to the meta-net
-        self.inner_q_net.load_state_dict(self.meta_q_net.state_dict())
+        self.inner_policy_net.load_state_dict(self.meta_net.state_dict())
+        self.inner_target_net.load_state_dict(self.meta_net.state_dict())
 
         #this is basically adaption phase
         train_values = self.inner_loop(task, train=True) #train the inner-net
@@ -634,7 +654,7 @@ def run_experiment():
     parser.add_argument("--use_task_batches", type=bool, default=False, help="Whether to use task batches or not.")
     parser.add_argument("--task_batch_size", type=int, default=10, help="The size of the task batches, only used if use_task_batches is True.")
     parser.add_argument("--use_second_order", type=bool, default=True, help="Whether to use second order gradients or not.")
-    parser.add_argument("--num_episodes", type=int, default=300, help="The number of episodes to run each environment for.")
+    parser.add_argument("--num_episodes", type=int, default=100, help="The number of episodes to run each environment for.")
     parser.add_argument("--num_steps", type=int, default=500, help="The number of steps to be done in each environment episode.")
     parser.add_argument("--hpt", type=bool, default=False, help="Whether to use hyperparameter tuning or not. All not given, hyperparameters are searched for.")
     parser.add_argument("--config", type=str, default="", help="The json-config file to be used for hyperparameter tuning. See the documentation for the format.")
