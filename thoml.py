@@ -300,27 +300,27 @@ class MetaNet():
         return loss
     
 
-    def compute_importances(self, task_losses:List[int], curr_epoch:int=-1)->List[torch.FloatTensor]:
+    def compute_importances(self, task_losses:int, curr_epoch:int=-1)->torch.FloatTensor:
         """Computes the importances of the individual losses computed in the current epoch.
 
         Args:
         tasks: int
             The number of tasks.
-        task_losses: List[int]
-            A list over the tasks: the number of losses per task.
+        task_losses: int
+            the number of losses in the task
         curr_epoch: int = -1
             The current epoch. If not given, the current epoch of the MetaNet is used.
         
         Returns:
-        List[torch.FloatTensor]: The importance of the individual losses. The list holds the tasks. The second dimension holds the importance of the losses of the task.
+        torch.FloatTensor: The importance of the individual losses.
 
         See the MAML++ paper with the code at https://github.com/AntreasAntoniou/HowToTrainYourMAMLPytorch/blob/master/few_shot_learning_system.py for the implementation of the importance computation. This function is the equivalent for get_per_step_loss_importance_vector().
         """
         current_epoch = (self.curr_task_batch if curr_epoch==-1 else curr_epoch)
 
         #initialize the loss weights, we do it as a matrix, not vector because prettier
-        loss_weights:np.ndarray = np.ones((len(task_losses), max(losses for losses in task_losses))) # size=n_tasks x n_losses
-        n_losses = sum(losses for losses in task_losses)
+        loss_weights:np.ndarray = np.ones((task_losses,)) # size=n_tasks x n_losses
+        n_losses = task_losses
         loss_weights /= n_losses #set to uniform distribution
 
         #decay rate for the loss weights (later epochs have less importance)
@@ -332,23 +332,19 @@ class MetaNet():
     
         #compute last element
         curr_value = np.minimum(
-            loss_weights[-1, -1] + (current_epoch * (n_losses - 1) * decay_rate),
+            loss_weights[-1] + (current_epoch * (n_losses - 1) * decay_rate),
             1.0 - ((n_losses - 1) * min_value_for_non_final_losses))
-        loss_weights[-1, -1] = curr_value
+        loss_weights[-1] = curr_value
         #retransform into list
-        loss_weights_list = [torch.tensor(loss_weights[i, :task_losses[i]]).to(self.device) for i in range(len(task_losses))]
-        return loss_weights_list
+        return torch.tensor(loss_weights).to(self.device)
 
 
     def meta_update(self, tasks:List[RLTask], test_task_losses:List[torch.Tensor], train_task_gradients:List[torch.Tensor])->float:
         """Updates the meta-net parameters based on the test task losses"""
         #get the importances of all the train losses to the total test loss
-        loss_weights = self.compute_importances([l.size(0) for l in test_task_losses])
+        
 
         # meta_gradient = [torch.zeros_like(param) for param in self.meta_net.parameters()]
-
-        total_test_loss = torch.sum(torch.stack(list(torch.sum(task_weight * task_loss) for task_weight, task_loss in zip(loss_weights, test_task_losses))))
-        total_test_loss /= len(tasks)
 
         self.meta_optimizer.zero_grad()
         total_test_loss.backward() #this should be the 2nd order gradient for the meta-net
@@ -530,11 +526,13 @@ class MetaNet():
 
         #first make some new memories on the test data
         # test_memories = [MemoryBuffer(self.memory_size) for _ in range(len(tasks))]
-        indiv_test_losses:List[torch.FloatTensor] = [None for _ in range(len(tasks))]
+        # indiv_test_losses:List[torch.FloatTensor] = [None for _ in range(len(tasks))]
         train_gradients = [] #empty list, we append to it in the inner-loop, use it like a pointer
         test_reward = 0
         test_loss = torch.tensor(0.0).to(self.device)
 
+        #see here on how/why we do the batching like this: https://stackoverflow.com/questions/62067400/understanding-accumulated-gradients-in-pytorch
+        self.meta_optimizer.zero_grad()
         for t, __task in enumerate(tasks):
             #reset the inner-net to the meta-net
             self.inner_policy_net.load_state_dict(self.meta_net.state_dict())
@@ -544,15 +542,19 @@ class MetaNet():
             task_train_score, task_train_loss  = self.inner_loop(__task, train=True, ret_gradient_ptr=train_gradients) #train the inner-net
             
             #this is the query phase
-            task_test_score, task_test_loss, indiv_test_losses[t] = self.inner_loop(__task, train=False)
-            test_reward += task_test_score
-            test_loss += task_test_loss / len(indiv_test_losses[t])
+            task_test_score, task_test_loss, indiv_test_losses = self.inner_loop(__task, train=False)
+            test_reward += task_test_score / len(tasks)
+            test_loss += task_test_loss / len(indiv_test_losses) / len(tasks)
+
+            loss_weights = self.compute_importances(indiv_test_losses.size(0))
+            weighted_losses = torch.sum(loss_weights * indiv_test_losses) / len(tasks)
+
+            weighted_losses.backward()
 
             __task.env.close()
 
-        #and now we learn the meta-net, for this we bascially do the same as above but this time don't update the alpha/beta and the inner-net
-        #and then we update the meta-net based on the rewards of the inner-net given the prior weights it got from the meta net
-        self.meta_update(tasks, test_task_losses=indiv_test_losses, train_task_gradients=train_gradients) #update the meta-net
+        self.meta_optimizer.step()
+
         test_reward /= len(tasks)
         return test_reward, test_loss
 
@@ -581,7 +583,7 @@ class MetaNet():
 
 
 
-def learn_meta_net(env_name:str="RandomCartPole", n_tasks:int=1000, episodes:int=10, n_steps:int=500, **kwargs):
+def learn_meta_net(env_name:str="RandomCartPole", n_tasks:int=1000, task_batch_size:int=10, episodes:int=10, n_steps:int=500, **kwargs):
     """
     Learns a meta and inner RL net for the given environment.
     Args:
@@ -589,6 +591,8 @@ def learn_meta_net(env_name:str="RandomCartPole", n_tasks:int=1000, episodes:int
         The name of the environment to be used. The environment should be registered in gym.
     n_tasks: int
         The number of tasks to be generated.
+    task_batch_size: int
+        The size of the task batches.
     episodes: int
         The number of episodes per task. This is normally how many times the agent gets to revisit the environment from the ground up.
     n_steps: int
@@ -609,7 +613,11 @@ def learn_meta_net(env_name:str="RandomCartPole", n_tasks:int=1000, episodes:int
     meta_net:MetaNet = MetaNet(state_dim, action_dim, num_task_batches=n_tasks, num_steps=n_steps, **kwargs) #total_epochs is task_iterations
 
     envset = EnvSet(env_name, norm)
-    train_task_set:List[RLTask] = [generate_task(envset.sample(), episodes=episodes, portion_test=0.5) for _ in range(n_tasks)]
+    train_task_set:List[RLTask]|List[List[RLTask]]
+    if task_batch_size == 1:
+        train_task_set:List[RLTask] = [generate_task(envset.sample(), episodes=episodes, portion_test=0.5) for _ in range(n_tasks)]
+    else:
+        train_task_set:List[List[RLTask]] = [[generate_task(envset.sample(), episodes=episodes, portion_test=0.5) for _ in range(task_batch_size)] for _ in range(n_tasks)]
     test_task_set:List[RLTask] = [generate_task(envset.sample(), episodes=episodes, portion_test=0.5) for _ in range(n_tasks)]
 
     train_scores = []
@@ -623,8 +631,8 @@ def learn_meta_net(env_name:str="RandomCartPole", n_tasks:int=1000, episodes:int
 
     #TODO find out whether we should see each task batch multiple times before going to the next task batch. See MAML++ code: https://github.com/AntreasAntoniou/HowToTrainYourMAMLPytorch/blob/master/few_shot_learning_system.py#L232. 
     # Our current analog is that we sample from the environment many times. But we could also think of this as seeing each task batch multiple times before seeing the next one.
-    for t, task in tqdm(enumerate(train_task_set), desc="Training MetaNet"):
-        avg_score, avg_loss = meta_net.meta_learn(task) #training epoch
+    for t, tasks in tqdm(enumerate(train_task_set), desc="Training MetaNet"):
+        avg_score, avg_loss = meta_net.meta_learn(tasks) #training epoch
         train_scores.append(avg_score)
 
         #log to wandb
