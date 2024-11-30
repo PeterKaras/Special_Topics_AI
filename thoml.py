@@ -18,10 +18,11 @@ from scipy.stats import norm, uniform
 import wandb
 
 class QNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=256, layers=3):
+    def __init__(self, state_dim, action_dim, hidden_dim=256, layers=3, use_softmax:bool=False):
         super(QNetwork, self).__init__()
         if layers < 2:
             raise ValueError("Number of layers should be at least 2")
+        self.use_softmax = use_softmax
         
         self.fc1 = nn.Linear(state_dim, hidden_dim)
         if layers == 2:
@@ -36,7 +37,11 @@ class QNetwork(nn.Module):
     def forward(self, state):
         x = F.relu(self.fc1(state))
         x = F.relu(self.fc2(x))
-        return self.fc3(x) + self.skip_transform(state) # Outputs Q-values for each action
+        # Outputs Q-values for each action
+        if self.use_softmax:
+            return torch.softmax(self.fc3(x) + self.skip_transform(state), dim=0)
+        else:
+            return self.fc3(x) + self.skip_transform(state)
     
 class MemoryBuffer:
     # A simple memory buffer to store experiences
@@ -97,10 +102,11 @@ class RLTask:
 def generate_task(env:gym.Env, episodes:int=10, portion_test:float=0.5)->RLTask:
     return RLTask(env, episodes, portion_test)
 
+MetaUpdateMethod = Literal["reptile", "maml", "mix"]
 class MetaNet():
     def __init__(self, state_dim:int, action_dim:int, hidden_dim:int=64, layers:int=3, 
         meta_lr:float=0.01, meta_min_lr:float=0.0001, num_task_batches:int=1000, 
-        use_reptile:bool=True, use_second_order:bool=False,
+        meta_update_method:MetaUpdateMethod="reptile", #TODO: how to mix reptile and maml properly
         gamma:float=0.99, lossFn:Callable=nn.SmoothL1Loss, inner_lr:float=0.0001, heuristic_update_inner_lr:bool=False, 
         tau:float=0.001, num_steps:int=500, update_rate:int=8, batch_size:int=32, memory_size:int=10000,
         initial_alpha=1.0, initial_beta=1.0, useMetaSampling:bool=False,
@@ -123,10 +129,7 @@ class MetaNet():
             The minimum learning rate of the meta-net, used for the CosineAnnealingLR scheduler.
         num_task_batches: int = 1000
             The total number of task batches that are learned. "Just like an episode".
-        use_reptile: bool = True
-            Whether to use the reptile algorithm or not. If not, the meta-net will be trained with the normal backpropagation.
-        use_second_order: bool = False
-            Whether to use second order gradients or not. This is necessary for the reptile algorithm.
+        meta_update_method: MetaUpdateMethod = "reptile"
         gamma: float = 0.99
             The discount factor.
         lossFn: Callable = nn.SmoothL1Loss
@@ -167,6 +170,10 @@ class MetaNet():
         
 
         #meta learning params
+        use_reptile = meta_update_method == "reptile"
+        use_second_order = meta_update_method == "maml"
+        use_mix = meta_update_method == "mix"
+
         self.meta_lr = meta_lr
         self.meta_min_lr = meta_min_lr
 
@@ -354,14 +361,11 @@ class MetaNet():
             #how do we regularize? 
             # -> for large alpha and beta, it should be close to the thompson sampling, as this is the optimal policy
             # -> for low alpha and beta, it does not need to be close as we want the meta-learning to have an effect
-            sampled_values = self.inner_policy_net(torch.cat([
+            sampled_values = self.inner_policy_net(torch.cat([#softmax already appied
                 torch.tensor([state]).to(self.device), 
                 torch.tensor(self.alpha, dtype=torch.float32).to(self.device), 
                 torch.tensor(self.beta, dtype=torch.float32).to(self.device)
             ])) 
-            sampled_values = torch.softmax(sampled_values, dim=0) #softmax to get probabilities
-            #we use the cross-entropy loss during loss computation which has the softmax included,
-            #but for prediction we also need the probabilities, so we apply it here as well.
             #TODO possible use some other thing as softmax if it is unstable?
             
         else:
@@ -701,7 +705,7 @@ def run_experiment():
     parser.add_argument("--n_tasks", type=int, default=1000, help="The number of tasks to be generated.")
     parser.add_argument("--use_task_batches", type=bool, default=False, help="Whether to use task batches or not.")
     parser.add_argument("--task_batch_size", type=int, default=10, help="The size of the task batches, only used if use_task_batches is True.")
-    parser.add_argument("--use_second_order", type=bool, default=True, help="Whether to use second order gradients or not.")
+    parser.add_argument("--update_method", type=str default="reptile", help="Whether to use second order gradients or not.")
     parser.add_argument("--num_episodes", type=int, default=100, help="The number of episodes to run each environment for.")
     parser.add_argument("--num_steps", type=int, default=500, help="The number of steps to be done in each environment episode.")
     parser.add_argument("--hpt", type=bool, default=False, help="Whether to use hyperparameter tuning or not. All not given, hyperparameters are searched for.")
@@ -723,7 +727,7 @@ def run_experiment():
             n_tasks=args.n_tasks, 
             episodes=args.num_episodes, 
             n_steps=args.num_steps, 
-            use_second_order=args.use_second_order
+            meta_update_method=args.update_method
         )
 
         # plot the train and test scores
