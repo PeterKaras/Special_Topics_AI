@@ -74,8 +74,8 @@ class RLTask:
         self.env:gym.Env = env
         self.size:int = episodes
         self.portion_test:float = portion_test
-        self.train_set:List[int] = [i for i in range(math.ceil(episodes*portion_test))]
-        self.test_set:List[int] = [i for i in range(math.ceil(episodes*portion_test), episodes)]
+        self.train_set:Generator[int] = range(math.ceil(episodes*(1-portion_test)))
+        self.test_set:Generator[int] = range(math.ceil(episodes*(1-portion_test)), episodes)
 
     
     def train_sample(self)->Generator[Tuple[Env, Any], None, None]:
@@ -99,7 +99,8 @@ def generate_task(env:gym.Env, episodes:int=10, portion_test:float=0.5)->RLTask:
 
 class MetaNet():
     def __init__(self, state_dim:int, action_dim:int, hidden_dim:int=64, layers:int=3, 
-        meta_lr:float=0.00001, meta_min_lr:float=0.000001, num_task_batches:int=1000, use_second_order:bool=False,
+        meta_lr:float=0.01, meta_min_lr:float=0.0001, num_task_batches:int=1000, 
+        use_reptile:bool=True, use_second_order:bool=False,
         gamma:float=0.99, lossFn:Callable=nn.SmoothL1Loss, inner_lr:float=0.0001, heuristic_update_inner_lr:bool=False, 
         tau:float=0.001, num_steps:int=500, update_rate:int=8, batch_size:int=32, memory_size:int=10000,
         initial_alpha=1.0, initial_beta=1.0, useMetaSampling:bool=False,
@@ -122,7 +123,10 @@ class MetaNet():
             The minimum learning rate of the meta-net, used for the CosineAnnealingLR scheduler.
         num_task_batches: int = 1000
             The total number of task batches that are learned. "Just like an episode".
+        use_reptile: bool = True
+            Whether to use the reptile algorithm or not. If not, the meta-net will be trained with the normal backpropagation.
         use_second_order: bool = False
+            Whether to use second order gradients or not. This is necessary for the reptile algorithm.
         gamma: float = 0.99
             The discount factor.
         lossFn: Callable = nn.SmoothL1Loss
@@ -170,6 +174,11 @@ class MetaNet():
         self.curr_task_batch = 0
         self.num_task_batches = num_task_batches
         
+        #xor the use_reptile and useMetaSampling, as they are mutually exclusive
+        if (useMetaSampling and use_reptile) or (not useMetaSampling and not use_reptile):
+            raise ValueError("The use of reptile and meta-sampling is mutually exclusive. Please set only one to True/False.")
+
+        self.use_reptile = use_reptile
         self.use_second_order = use_second_order #whether to allow second order gradients to be build up
 
         self.penalty_factor = 0.1
@@ -339,28 +348,6 @@ class MetaNet():
         return torch.tensor(loss_weights).to(self.device)
 
 
-    def meta_update(self, tasks:List[RLTask], test_task_losses:List[torch.Tensor], train_task_gradients:List[torch.Tensor])->float:
-        """Updates the meta-net parameters based on the test task losses"""
-        #get the importances of all the train losses to the total test loss
-        
-
-        # meta_gradient = [torch.zeros_like(param) for param in self.meta_net.parameters()]
-
-        self.meta_optimizer.zero_grad()
-        total_test_loss.backward() #this should be the 2nd order gradient for the meta-net
-
-        #compute the task meta gradients
-        #use the train gradients to improve the meta gradients #TODO is this necessary? the right way? hurtful?
-        # for t,_ in enumerate(tasks):
-        #     for meta_grad, meta_param, task_grad in zip(meta_gradient, self.meta_q_net.parameters(), train_task_gradients[t]):
-        #         meta_grad += meta_param.grad * task_grad
-
-        # for meta_grad in meta_gradient:
-        #     meta_grad /= len(tasks)
-
-        self.meta_optimizer.step()
-
-
     def select_action(self, state:torch.Tensor)->torch.Tensor:
         """Selects an action based on the state. The action is selected by sampling from the q-values. And then selecting the action with the highest value. If the meta-sampling is used, the inner net also gets the alpha and beta values, otherwise we use thompson sampling and multiply the q-values with the sampled probabilities."""
         if self.useMetaSampling:
@@ -453,10 +440,12 @@ class MetaNet():
         env_step = 0
         for env, init_state in (task.train_sample() if train else task.test_sample()):
             score = 0
+            duration = 0
             losses = []
             state = torch.tensor(init_state, dtype=torch.float32).to(self.device)
             for s in range(self.num_steps):
                 env_step += 1
+                duration += 1
                 #select action and do it
                 action = self.select_action(state) #uses the inner-net to select the action
                 next_state, reward, terminated, truncated, _ = env.step(action.numpy()) #take the action in the environment
@@ -495,6 +484,10 @@ class MetaNet():
                     break
                 if truncated:
                     break
+            
+            #show current performance in the environment: the duration of the epsiode
+            print(f"\rCurrent Episode Duration: {duration} / {self.num_steps}", end="")
+                
 
             env_scores.append(score)
             env_losses.append(torch.stack(losses).sum() if len(losses) > 0 else torch.tensor(500).to(self.device))
@@ -503,7 +496,7 @@ class MetaNet():
                 ret_memory_ptr.buffer = deepcopy(self.memory.buffer)
 
         total_score = sum(env_scores)
-        if len(indiv_losses) == 0:
+        if len(indiv_losses) == 0 and not train:#if no losses and test, we have a problem
             raise RuntimeError("No losses were computed. Increase the number of episodes per environment.")
         return (total_score, torch.stack(env_losses).mean()) if train else (score, torch.stack(env_losses).mean(), torch.stack(indiv_losses))
         
@@ -531,9 +524,11 @@ class MetaNet():
         test_reward = 0
         test_loss = torch.tensor(0.0).to(self.device)
 
+        task_meta_gradients = []
+
         #see here on how/why we do the batching like this: https://stackoverflow.com/questions/62067400/understanding-accumulated-gradients-in-pytorch
         self.meta_optimizer.zero_grad()
-        for t, __task in enumerate(tasks):
+        for t, __task in tqdm(enumerate(tasks), "Task i from Current Task Batch", total=len(tasks)):
             #reset the inner-net to the meta-net
             self.inner_policy_net.load_state_dict(self.meta_net.state_dict())
             self.inner_target_net.load_state_dict(self.meta_net.state_dict())
@@ -541,21 +536,28 @@ class MetaNet():
             #this is basically support phase (== adaption during meta-training)
             task_train_score, task_train_loss  = self.inner_loop(__task, train=True, ret_gradient_ptr=train_gradients) #train the inner-net
             
-            #this is the query phase
-            task_test_score, task_test_loss, indiv_test_losses = self.inner_loop(__task, train=False)
-            test_reward += task_test_score / len(tasks)
-            test_loss += task_test_loss / len(indiv_test_losses) / len(tasks)
+            if not self.use_reptile: #if using maml, we need to backpropagate the loss through the inner updates
+                #this is the query phase
+                task_test_score, task_test_loss, indiv_test_losses = self.inner_loop(__task, train=False)
+                test_reward += task_test_score / len(tasks)
+                test_loss += task_test_loss / len(indiv_test_losses) / len(tasks)
 
-            loss_weights = self.compute_importances(indiv_test_losses.size(0))
-            weighted_losses = torch.sum(loss_weights * indiv_test_losses) / len(tasks)
+                loss_weights = self.compute_importances(indiv_test_losses.size(0))
+                weighted_losses = torch.sum(loss_weights * indiv_test_losses) / len(tasks)
 
-            weighted_losses.backward()
+                weighted_losses.backward()
+            
+            else: #use reptile, just compute the difference of the inner-net and the meta-net
+                task_test_score, task_test_loss, _ = self.inner_loop(__task, train=False)
+                test_reward += task_test_score / len(tasks)
+                test_loss += task_test_loss / len(tasks)
+                for param, meta_param in zip(self.inner_policy_net.parameters(), self.meta_net.parameters()):
+                    meta_param.grad = meta_param.data - param.data / len(tasks)
 
             __task.env.close()
 
         self.meta_optimizer.step()
 
-        test_reward /= len(tasks)
         return test_reward, test_loss
 
 
@@ -581,9 +583,34 @@ class MetaNet():
         return test_values[0], test_values[2]
 
 
+def episode_curriculum(max_episodes:int, min_episodes:int, T_max:int, t:int, less:bool=True)->int:
+    """The episode curriculum function, which returns the number of episodes to be done in the current task.
+    Args:
+    max_episodes: int
+        The maximum number of episodes to be done in a task.
+    min_episodes: int
+        The minimum number of episodes to be done in a task.
+    T_max: int
+        The maximum number of time steps.
+    t: int
+        the current time step.
+    less: bool = True
+        Whether the number of episodes should decrease or increase over time. If True, the number of episodes will decrease over time, if False, the number of episodes will increase over time.
+    Returns:
+    int: The number of episodes to be done in the current task.
+    """
+    if t >= 2*T_max/3:# after 2/3 of the time, we should have reached the goal number of episodes and train on them some time.
+        if less:
+            return min_episodes
+        else:
+            return max_episodes
+    else:
+        if less:
+            return math.floor(max_episodes - ((max_episodes - min_episodes) * t / (2*T_max/3)))
+        else:
+            return math.floor(min_episodes + ((max_episodes - min_episodes) * t+1 / (2*T_max/3)))
 
-
-def learn_meta_net(env_name:str="RandomCartPole", n_tasks:int=1000, task_batch_size:int=10, episodes:int=10, n_steps:int=500, **kwargs):
+def learn_meta_net(env_name:str="RandomCartPole", n_tasks:int=1000, task_batch_size:int=10, episodes:int=30, n_steps:int=500, **kwargs):
     """
     Learns a meta and inner RL net for the given environment.
     Args:
@@ -594,17 +621,18 @@ def learn_meta_net(env_name:str="RandomCartPole", n_tasks:int=1000, task_batch_s
     task_batch_size: int
         The size of the task batches.
     episodes: int
-        The number of episodes per task. This is normally how many times the agent gets to revisit the environment from the ground up.
+        The number of episodes per task task. This is normally how many times the agent gets to revisit the environment from the ground up. In training, we start with a much higher number of episodes, and then reduce it to a lower number of episodes.
     n_steps: int
         The number of steps per episode. This is how long the agent may interact with the environment, before reset. Should be less equal to the max steps of the environment.
     kwargs: dict
         The keyword arguments to be passed to the MetaNet constructor. 
     """
+    gym_env:Env
     if env_name not in possible_envs.keys():
         print(f"Environment {env_name} not found in the meta environments. Assuming it is a normal gym environment.")
-
-    
-    gym_env = gym.make(possible_envs[env_name])
+        gym_env = gym.make(env_name)
+    else:
+        gym_env = gym.make(possible_envs[env_name])
     action_dim:int = gym_env.action_space.n
     state_dim:int = gym_env.observation_space.shape[0]
     gym_env.close()
@@ -615,9 +643,21 @@ def learn_meta_net(env_name:str="RandomCartPole", n_tasks:int=1000, task_batch_s
     envset = EnvSet(env_name, norm)
     train_task_set:List[RLTask]|List[List[RLTask]]
     if task_batch_size == 1:
-        train_task_set:List[RLTask] = [generate_task(envset.sample(), episodes=episodes, portion_test=0.5) for _ in range(n_tasks)]
+        train_task_set:List[RLTask] = [
+            generate_task(
+                envset.sample(), 
+                episodes=episode_curriculum(10*episodes, episodes, n_tasks, t), 
+                portion_test=0.5
+            ) for t in range(n_tasks)
+        ]
     else:
-        train_task_set:List[List[RLTask]] = [[generate_task(envset.sample(), episodes=episodes, portion_test=0.5) for _ in range(task_batch_size)] for _ in range(n_tasks)]
+        train_task_set:List[List[RLTask]] = [
+            [generate_task(
+                envset.sample(), 
+                episodes=episode_curriculum(10*episodes, episodes, n_tasks, t), 
+                portion_test=0.5
+            ) for _ in range(task_batch_size)] for t in range(n_tasks)
+        ]
     test_task_set:List[RLTask] = [generate_task(envset.sample(), episodes=episodes, portion_test=0.5) for _ in range(n_tasks)]
 
     train_scores = []
@@ -631,7 +671,7 @@ def learn_meta_net(env_name:str="RandomCartPole", n_tasks:int=1000, task_batch_s
 
     #TODO find out whether we should see each task batch multiple times before going to the next task batch. See MAML++ code: https://github.com/AntreasAntoniou/HowToTrainYourMAMLPytorch/blob/master/few_shot_learning_system.py#L232. 
     # Our current analog is that we sample from the environment many times. But we could also think of this as seeing each task batch multiple times before seeing the next one.
-    for t, tasks in tqdm(enumerate(train_task_set), desc="Training MetaNet"):
+    for t, tasks in tqdm(enumerate(train_task_set), desc="Training MetaNet", total=n_tasks):
         avg_score, avg_loss = meta_net.meta_learn(tasks) #training epoch
         train_scores.append(avg_score)
 
