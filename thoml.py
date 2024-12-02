@@ -34,7 +34,7 @@ class QNetwork(nn.Module):
         #we introduce a transform skip connection to allow for gradients to flow easier to the maml network during it's update.
         self.skip_transform = nn.Linear(state_dim, action_dim) 
 
-    def forward(self, state):
+    def forward(self, state) -> torch.Tensor:
         x = F.relu(self.fc1(state))
         x = F.relu(self.fc2(x))
         # Outputs Q-values for each action
@@ -106,7 +106,7 @@ MetaUpdateMethod = Literal["reptile", "maml", "mix"]
 class MetaNet():
     def __init__(self, state_dim:int, action_dim:int, hidden_dim:int=64, layers:int=3, 
         meta_lr:float=0.01, meta_min_lr:float=0.0001, num_task_batches:int=1000, 
-        meta_update_method:MetaUpdateMethod="reptile", #TODO: how to mix reptile and maml properly
+        meta_transition_frame:Tuple[int, int]=(50, 80), reptile_decay:float=0.2,#TODO: how to mix reptile and maml properly
         gamma:float=0.99, lossFn:Callable=nn.SmoothL1Loss, inner_lr:float=0.0001, heuristic_update_inner_lr:bool=False, 
         tau:float=0.001, num_steps:int=500, update_rate:int=8, batch_size:int=32, memory_size:int=10000,
         initial_alpha=1.0, initial_beta=1.0, useMetaSampling:bool=False,
@@ -129,10 +129,14 @@ class MetaNet():
             The minimum learning rate of the meta-net, used for the CosineAnnealingLR scheduler.
         num_task_batches: int = 1000
             The total number of task batches that are learned. "Just like an episode".
-        meta_update_method: MetaUpdateMethod = "reptile"
+        meta_transition_frame: Tuple[int, int] = (50, 80)
+            Given (a,b): The number of inner updates `u` done for the meta update to behave like MAML (u<a), like reptile (b<=u), or a smooth transition between the two (a<=u<b). The smooth transition is a sigmoid.
+        reptile_decay:float = 0.2
+            The rate of the exponential decay applied to reptile updates based on parameter l2-distance.
         gamma: float = 0.99
-            The discount factor.
+            The discount factor for the q-net rewards.
         lossFn: Callable = nn.SmoothL1Loss
+            The loss function to be used for the inner-net update.
         inner_lr: float = 0.005
             The learning rate of the inner-net. 
         heuristic_update_inner_lr: bool = False
@@ -170,10 +174,6 @@ class MetaNet():
         
 
         #meta learning params
-        use_reptile = meta_update_method == "reptile"
-        use_second_order = meta_update_method == "maml"
-        use_mix = meta_update_method == "mix"
-
         self.meta_lr = meta_lr
         self.meta_min_lr = meta_min_lr
 
@@ -181,14 +181,11 @@ class MetaNet():
         self.curr_task_batch = 0
         self.num_task_batches = num_task_batches
         
-        #xor the use_reptile and useMetaSampling, as they are mutually exclusive
-        if (useMetaSampling and use_reptile) or (not useMetaSampling and not use_reptile):
-            raise ValueError("The use of reptile and meta-sampling is mutually exclusive. Please set only one to True/False.")
-
-        self.use_reptile = use_reptile
-        self.use_second_order = use_second_order #whether to allow second order gradients to be build up
-
-        self.penalty_factor = 0.1
+        #meta-update related params
+        self.meta_transition_frame = meta_transition_frame
+        self.transition_sigma = 10.0
+        self.reptile_decay = reptile_decay
+        
 
         #inner learning params
         self.useMetaSampling = useMetaSampling
@@ -204,6 +201,8 @@ class MetaNet():
         self.memory_size = memory_size
         self.memory = MemoryBuffer(memory_size)
         self.gamma = gamma
+
+        self.penalty_factor = 0.1
 
         #why should we use thompson sampling when already using NNs? because this is feature engineering, and we want to keep the NNs as simple as possible, to avoid overfitting and to make the meta-learning easier.
         self.initial_alpha = initial_alpha
@@ -390,19 +389,27 @@ class MetaNet():
 
         state, ab, action, _, _, _ = self.memory.buffer[-1]
         if self.useMetaSampling:
-            q_values = self.inner_policy_net(torch.cat([
+            q_values:torch.Tensor = self.inner_policy_net(torch.cat([
                 torch.tensor([state]).to(self.device), 
                 torch.tensor([*list(ab.flatten())]).to(self.device)
             ])).squeeze(0)
         else:
-            q_values = self.inner_policy_net(state)
-        #normalize q_values to have a max of 1
-        q_values = q_values / q_values.abs().max()
+            q_values:torch.Tensor = self.inner_policy_net(state)
+        #normalize q_values to with min-max
+        q_values = (q_values - q_values.min()) / (q_values.max() - q_values.min() + 1e-8)
 
+        #3 variations: either 2nd best / average of all other actions / ema of loss over all actions
 
-        scnd_best_action = torch.argsort(q_values, descending=True)[1]
+        # 2nd best action
+        # scnd_best_action = torch.argsort(q_values, descending=True)[1]
+        # penalty = (q_values[action] - q_values[scnd_best_action]).pow(2) + 1e-2 #add a small value to have smoother gradients
 
-        penalty = (q_values[action] - q_values[scnd_best_action]).pow(2)
+        # average of all other actions
+        average_penalty = (q_values.sum() - q_values[action]) / (self.action_dim - 1)
+        penalty = (q_values[action] - average_penalty).pow(2) + 1e-2 #add a small value to have smoother gradients
+
+        # ema of loss over all actions
+        #get all the losses for all actions until step s, then ema them
 
         return (self.num_steps -step)/self.num_steps * penalty * self.penalty_factor
 
@@ -503,6 +510,9 @@ class MetaNet():
         if len(indiv_losses) == 0 and not train:#if no losses and test, we have a problem
             raise RuntimeError("No losses were computed. Increase the number of episodes per environment.")
         return (total_score, torch.stack(env_losses).mean()) if train else (score, torch.stack(env_losses).mean(), torch.stack(indiv_losses))
+    
+    
+
         
     def meta_learn(self, task:RLTask|List[RLTask])->Tuple[float, float]:
         """This function should be used to learn the meta-net. It should return the average score of the tasks, and the average loss of the tasks.
@@ -514,6 +524,29 @@ class MetaNet():
         Returns:
         Tuple[float, float]: The average score of the tasks, and the average loss of the tasks.
         """
+        def compute_soft_weight(U:int, R:int, M:int, sigma:float=10.0):
+            """
+            Compute the soft weight for Reptile based on the number of inner updates.
+
+            Args:
+                U (int): The actual number of inner updates performed.
+                R (int): Minimum number of updates required for Reptile to be used.
+                M (int): Maximum number of updates for MAML to be used.
+                sigma (float): Controls the steepness of the blending. Higher values make the transition sharper.
+
+            Returns:
+                float: The weight for Reptile (0 to 1).
+            """
+            #TODO: theoretically we don't want jumps so we could use these tangents to make it smooth:
+            # d(1/(1+exp(-5*(x-0.5))))/(dx) *x = 1/(1+exp(-5*(x-0.5))) (for x->0), symmetric for x->1
+            if U < R:
+                return 0.0
+            elif U > M:
+                return 1.0
+            else:
+                # Smooth transition between R and M
+                scale = (U - R) / (M - R)  # Normalize U to range [0, 1]
+                return 1.0 / (1.0 + torch.exp(-sigma * (scale - 0.5)))  # Sigmoid-based blend
         
         tasks:List[RLTask] = []
         if isinstance(task, RLTask):
@@ -531,7 +564,7 @@ class MetaNet():
         task_meta_gradients = []
 
         #see here on how/why we do the batching like this: https://stackoverflow.com/questions/62067400/understanding-accumulated-gradients-in-pytorch
-        self.meta_optimizer.zero_grad()
+        self.meta_optimizer.zero_grad(set_to_none=False)#we want it to be 0
         for t, __task in tqdm(enumerate(tasks), "Task i from Current Task Batch", total=len(tasks)):
             #reset the inner-net to the meta-net
             self.inner_policy_net.load_state_dict(self.meta_net.state_dict())
@@ -540,23 +573,59 @@ class MetaNet():
             #this is basically support phase (== adaption during meta-training)
             task_train_score, task_train_loss  = self.inner_loop(__task, train=True, ret_gradient_ptr=train_gradients) #train the inner-net
             
-            if not self.use_reptile: #if using maml, we need to backpropagate the loss through the inner updates
-                #this is the query phase
-                task_test_score, task_test_loss, indiv_test_losses = self.inner_loop(__task, train=False)
-                test_reward += task_test_score / len(tasks)
-                test_loss += task_test_loss / len(indiv_test_losses) / len(tasks)
+            #now we do the query phase
+            task_test_score, task_test_loss, indiv_test_losses = self.inner_loop(__task, train=False)
+            test_reward += task_test_score / len(tasks)
+            test_loss += task_test_loss / len(indiv_test_losses) / len(tasks)
 
+            #and now we do a really special meta-update that blends reptile and maml.
+            #if the number of inner updates is less than b of the transition frame, we do a maml update
+            #if it is more than a we do a reptile update,
+            #if it is in between, we do a sigmoid blend of the two.
+
+
+            if len(indiv_test_losses) < self.meta_transition_frame[1]:
                 loss_weights = self.compute_importances(indiv_test_losses.size(0))
                 weighted_losses = torch.sum(loss_weights * indiv_test_losses) / len(tasks)
-
                 weighted_losses.backward()
-            
-            else: #use reptile, just compute the difference of the inner-net and the meta-net
-                task_test_score, task_test_loss, _ = self.inner_loop(__task, train=False)
-                test_reward += task_test_score / len(tasks)
-                test_loss += task_test_loss / len(tasks)
+                #
+            if len(indiv_test_losses) >= self.meta_transition_frame[0]:
+                #reptile decay
+                l2_distance = torch.tensor(0.0)
+                for meta_param, inner_param in zip(self.meta_net.parameters(), self.inner_policy_net.parameters()):
+                    l2_distance += torch.norm(inner_param.data - meta_param.data).pow(2)
+                l2_distance = torch.sqrt(l2_distance)
+                decay_factor = torch.exp(-self.reptile_decay * l2_distance)
+                
+                #compute the soft reptile factor. Is ==1 if only reptile, 0<factor<1 if maml and reptile are blended
+                w_reptile = compute_soft_weight(
+                    len(indiv_test_losses), 
+                    self.meta_transition_frame[0], 
+                    self.meta_transition_frame[1], 
+                    sigma=self.transition_sigma
+                )
+
                 for param, meta_param in zip(self.inner_policy_net.parameters(), self.meta_net.parameters()):
-                    meta_param.grad = meta_param.data - param.data / len(tasks)
+                    #if only reptile this makes the meta_param.grad 0 and only the reptile update remains
+                    #if both this blends the two updates
+                    meta_param.grad = (1-w_reptile) * meta_param.grad\
+                                    +    w_reptile  * decay_factor * (meta_param.data - param.data / len(tasks))
+
+            self.meta_optimizer.step()
+
+            # if not self.use_reptile: #if using maml, we need to backpropagate the loss through the inner updates
+            #     #this is the query phase
+                
+
+            #     loss_weights = self.compute_importances(indiv_test_losses.size(0))
+            #     weighted_losses = torch.sum(loss_weights * indiv_test_losses) / len(tasks)
+
+            #     weighted_losses.backward()
+            
+            # else: #use reptile, just compute the difference of the inner-net and the meta-net
+
+            #     for param, meta_param in zip(self.inner_policy_net.parameters(), self.meta_net.parameters()):
+            #         meta_param.grad = meta_param.data - param.data / len(tasks)
 
             __task.env.close()
 
