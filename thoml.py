@@ -32,7 +32,8 @@ class QNetwork(nn.Module):
         self.fc3 = nn.Linear(hidden_dim, action_dim)
 
         #we introduce a transform skip connection to allow for gradients to flow easier to the maml network during it's update.
-        self.skip_transform = nn.Linear(state_dim, action_dim) 
+        self.skip_transform = nn.Linear(state_dim, action_dim, bias=False) 
+        self.skip_bn = nn.BatchNorm1d(action_dim) #also add a batchnorm to the skip connection, to make it more stable
 
     def forward(self, state) -> torch.Tensor:
         x = F.relu(self.fc1(state))
@@ -41,7 +42,7 @@ class QNetwork(nn.Module):
         if self.use_softmax:
             return torch.softmax(self.fc3(x) + self.skip_transform(state), dim=0)
         else:
-            return self.fc3(x) + self.skip_transform(state)
+            return self.fc3(x) + self.skip_bn(self.skip_transform(state))
     
 class MemoryBuffer:
     # A simple memory buffer to store experiences
@@ -106,7 +107,7 @@ MetaUpdateMethod = Literal["reptile", "maml", "mix"]
 class MetaNet():
     def __init__(self, state_dim:int, action_dim:int, hidden_dim:int=64, layers:int=3, 
         meta_lr:float=0.01, meta_min_lr:float=0.0001, num_task_batches:int=1000, 
-        meta_transition_frame:Tuple[int, int]=(50, 80), reptile_decay:float=0.2,#TODO: how to mix reptile and maml properly
+        meta_transition_frame:Tuple[int, int]=(50, 80), transition_sigma:float=10.0, reptile_decay:float=0.2,#TODO: how to mix reptile and maml properly
         gamma:float=0.99, lossFn:Callable=nn.SmoothL1Loss, inner_lr:float=0.0001, heuristic_update_inner_lr:bool=False, 
         tau:float=0.001, num_steps:int=500, update_rate:int=8, batch_size:int=32, memory_size:int=10000,
         initial_alpha=1.0, initial_beta=1.0, useMetaSampling:bool=False,
@@ -130,7 +131,8 @@ class MetaNet():
         num_task_batches: int = 1000
             The total number of task batches that are learned. "Just like an episode".
         meta_transition_frame: Tuple[int, int] = (50, 80)
-            Given (a,b): The number of inner updates `u` done for the meta update to behave like MAML (u<a), like reptile (b<=u), or a smooth transition between the two (a<=u<b). The smooth transition is a sigmoid.
+            Given (a,b): The number of inner updates `u` done for the meta update to behave like MAML (u<a), like reptile (u>=b), or a smooth transition between the two (a<=u<b). The smooth transition is a sigmoid. #TODO: maybe with linear end pieces
+        transition_sigma: float = 10.0
         reptile_decay:float = 0.2
             The rate of the exponential decay applied to reptile updates based on parameter l2-distance.
         gamma: float = 0.99
@@ -183,7 +185,7 @@ class MetaNet():
         
         #meta-update related params
         self.meta_transition_frame = meta_transition_frame
-        self.transition_sigma = 10.0
+        self.transition_sigma = transition_sigma
         self.reptile_decay = reptile_decay
         
 
