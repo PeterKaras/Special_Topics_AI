@@ -27,31 +27,33 @@ class RandomCartPoleEnv(gym.Env[np.ndarray, Union[int, np.ndarray]]):
         "render_fps": 50,
     }
 
-    def __init__(self,sutton_barto_reward: bool = False, render_mode: Optional[str] = None, seed:int=0, random_vars:Tuple[rv_continuous]=(uniform(),)):
+    def __init__(self, sutton_barto_reward: bool = False, render_mode: Optional[str] = None, seed: int = 0,
+                 random_vars: Tuple[rv_continuous] = (uniform(),)):
         """The random variable might make some environments unstable, so be careful with the random variable you choose, we try to constrict it to a space, where the environment is still solvable.
         We try to keep the means equal to the original values, which means some values which are important for rendering are not touched, like x_threshold.
         
         When a seed other than 0 is given, it is used to seed the random variable. Otherwise the random variable is seeded via system logic."""
         self.random_var = random_vars[0]
         rng = np.random.default_rng(seed if seed != 0 else None)
-        def seed()->float: 
-            return self.random_var.rvs(random_state=rng) - 0.5 #The seed is a float in [-0.5,0.5]
+
+        def seed() -> float:
+            return self.random_var.rvs(random_state=rng) - 0.5  # The seed is a float in [-0.5,0.5]
 
         self._sutton_barto_reward = sutton_barto_reward
 
-        self.gravity = 9.8 + 9.8*seed() #now gravity is in range [4.9,14.7] with mean 9.8
-        self.masscart = 1.0 +seed() #now masscart is in range [0.5,1.5] with mean 1.0
-        self.masspole = 0.1 + 0.1*seed() #now masspole is in range [0.05,0.15] with mean 0.1
+        self.gravity = 9.8 + 9.8 * seed()  # now gravity is in range [4.9,14.7] with mean 9.8
+        self.masscart = 1.0 + seed()  # now masscart is in range [0.5,1.5] with mean 1.0
+        self.masspole = 0.1 + 0.1 * seed()  # now masspole is in range [0.05,0.15] with mean 0.1
         self.total_mass = self.masspole + self.masscart
-        self.length = 0.5 + 0.3*seed() # actually half the pole's length, now in range [0.35,0.65] with mean 0.5
+        self.length = 0.5 + 0.3 * seed()  # actually half the pole's length, now in range [0.35,0.65] with mean 0.5
         self.polemass_length = self.masspole * self.length
-        self.force_mag = 10.0 + 4*seed() #now force_mag is in range [8,12] with mean 10.0
-        self.tau = 0.02 + 0.01*seed() # seconds between state updates, now in range [0.015,0.025] with mean 0.02
+        self.force_mag = 10.0 + 4 * seed()  # now force_mag is in range [8,12] with mean 10.0
+        self.tau = 0.02 + 0.01 * seed()  # seconds between state updates, now in range [0.015,0.025] with mean 0.02
         self.kinematics_integrator = "euler"
 
         # Angle at which to fail the episode
         self.theta_threshold_radians = 12 * 2 * math.pi / 360
-        self.theta_threshold_radians += 4*2*math.pi/360 * seed() #now theta_threshold_radians is in range [10,14] with mean 12
+        self.theta_threshold_radians += 4 * 2 * math.pi / 360 * seed()  # now theta_threshold_radians is in range [10,14] with mean 12
         self.x_threshold = 2.4
 
         # Angle limit set to 2 * theta_threshold_radians so failing observation
@@ -93,11 +95,11 @@ class RandomCartPoleEnv(gym.Env[np.ndarray, Union[int, np.ndarray]]):
         # For the interested reader:
         # https://coneural.org/florian/papers/05_cart_pole.pdf
         temp = (
-            force + self.polemass_length * np.square(theta_dot) * sintheta
-        ) / self.total_mass
+                       force + self.polemass_length * np.square(theta_dot) * sintheta
+               ) / self.total_mass
         thetaacc = (self.gravity * sintheta - costheta * temp) / (
-            self.length
-            * (4.0 / 3.0 - self.masspole * np.square(costheta) / self.total_mass)
+                self.length
+                * (4.0 / 3.0 - self.masspole * np.square(costheta) / self.total_mass)
         )
         xacc = temp - self.polemass_length * thetaacc * costheta / self.total_mass
 
@@ -145,10 +147,10 @@ class RandomCartPoleEnv(gym.Env[np.ndarray, Union[int, np.ndarray]]):
         return np.array(self.state, dtype=np.float32), reward, terminated, False, {}
 
     def reset(
-        self,
-        *,
-        seed: Optional[int] = None,
-        options: Optional[dict] = None,
+            self,
+            *,
+            seed: Optional[int] = None,
+            options: Optional[dict] = None,
     ):
         super().reset(seed=seed)
         # Note that if you use custom reset bounds, it may lead to out-of-bound
@@ -264,7 +266,6 @@ class RandomCartPoleEnv(gym.Env[np.ndarray, Union[int, np.ndarray]]):
     def close(self):
         if self.screen is not None:
             import pygame
-
             pygame.display.quit()
             pygame.quit()
             self.isopen = False
