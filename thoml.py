@@ -6,9 +6,10 @@ import torch.nn.functional as F
 import torch.optim as optim
 import gymnasium as gym
 from gymnasium.core import Env
-from collections import deque, OrderedDict
+from collections import deque, OrderedDict, namedtuple
+from itertools import count
 from tqdm import tqdm
-
+import random
 from typing import Dict, Optional, Callable, List, Generator, Tuple, Literal, overload, Any
 import math
 
@@ -17,64 +18,39 @@ from scipy.stats import norm, uniform
 
 import wandb
 
+# if GPU is to be used
+device = torch.device(
+    "cuda" if torch.cuda.is_available() else
+    "mps" if torch.backends.mps.is_available() else
+    "cpu"
+)
+
+Transition = namedtuple('Transition',
+                        ('state', 'action', 'next_state', 'reward'))
+TransitionV2 = namedtuple('Transition',
+                        ('state', 'alpha','beta', 'action', 'next_state', 'reward'))
 class QNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=256, layers=3, use_softmax:bool=False):
+    def __init__(self, n_observations, n_actions, hidden_layers:int=1, hidden_dim:int=128, rho:float=0.2, xi:float=0.2):
         super(QNetwork, self).__init__()
-        if layers < 2:
-            raise ValueError("Number of layers should be at least 2")
-        self.use_softmax = use_softmax
-        
-        self.fc1 = nn.Linear(state_dim, hidden_dim)
-        if layers == 2:
-            self.fc2 = nn.Identity(hidden_dim, hidden_dim)
-        else:
-            self.fc2 = nn.Sequential(*[nn.Linear(hidden_dim, hidden_dim) for _ in range(layers-2)])
-        self.fc3 = nn.Linear(hidden_dim, action_dim)
+        self.layer1 = nn.Linear(n_observations, hidden_dim)
+        self.layer2 = nn.Sequential(*[nn.Linear(hidden_dim, hidden_dim) for _ in range(hidden_layers)])
+        self.layer3 = nn.Linear(hidden_dim, n_actions)
 
-        #we introduce a transform skip connection to allow for gradients to flow easier to the maml network during it's update.
-        self.skip_transform = nn.Linear(state_dim, action_dim, bias=False) 
-        self.skip_bn = nn.BatchNorm1d(action_dim) #also add a batchnorm to the skip connection, to make it more stable
+        self.rho = rho #attention residual weight
 
-    def forward(self, state) -> torch.Tensor:
-        x = F.relu(self.fc1(state))
-        x = F.relu(self.fc2(x))
-        # Outputs Q-values for each action
-        if self.use_softmax:
-            return torch.softmax(self.fc3(x) + self.skip_transform(state), dim=0)
-        else:
-            return self.fc3(x) + self.skip_bn(self.skip_transform(state))
-    
-class MemoryBuffer:
-    # A simple memory buffer to store experiences
-    def __init__(self, max_size:int):
-        self.max_size = max_size
-        self.buffer = list() #new list()
-    
-    def append(self, experience:Tuple[torch.Tensor, List[int], int, float, torch.Tensor, bool]):
-        """Appends an experience to the memory buffer. The experience is a tuple of the 
-            - state, 
-            - the alpha-beta values
-            - the action, 
-            - the reward,
-            - the next state, 
-            - and whether the episode is done.
-        """
-        if len(self.buffer) >= self.max_size:
-            self.buffer.pop(0)
-        self.buffer.append(tuple(torch.tensor(e) if type(e)!=torch.Tensor else e for e in experience))
-    
-    def sample(self, batch_size:int, pop:bool=False)->List[Tuple[torch.Tensor, torch.IntTensor, torch.IntTensor, torch.FloatTensor, torch.Tensor, torch.BoolTensor]]:
-        """Samples a batch of experiences from the memory buffer. The experience is a tuple of the
-            - state, 
-            - the alpha-beta values
-            - the action, 
-            - the reward,
-            - the next state, 
-            - and whether the episode is done.
-        """
-        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
-        return [self.buffer.pop(i) for i in indices] if pop else [self.buffer[i] for i in indices]
+        self.xi = xi #input residual weight
 
+        self.skip = nn.Linear(n_observations, n_actions, bias=False)
+
+    # Called with either one element to determine next action, or a batch
+    # during optimization. Returns tensor([[left0exp,right0exp]...]).
+    def forward(self, inp):
+        x = F.relu(self.layer1(inp))
+        y = nn.functional.scaled_dot_product_attention(x, x, x)
+        y = F.relu(self.layer2(y))
+        bn_inp = F.batch_norm(self.skip(inp))
+        return self.layer3(y + self.rho*x + self.xi*bn_inp)
+    
 class RLTask:
     def __init__(self, env:gym.Env, episodes:int, portion_test:float):
         self.env:gym.Env = env
@@ -100,6 +76,243 @@ class RLTask:
             state, _ = self.env.reset(seed=task)
             yield self.env, state
 
+class ReplayMemory(object):
+
+    def __init__(self, capacity):
+        self.memory = deque([], maxlen=capacity)
+
+    def push(self, *args):
+        """Save a transition"""
+        self.memory.append(Transition(*args))
+
+    def sample(self, batch_size):
+        return random.sample(self.memory, batch_size)
+
+    def __len__(self):
+        return len(self.memory)
+class EntropyThresholdController:
+    def __init__(self, tau_min=0.1, tau_max=1.0, alpha=0.1, loss_max=1.0):
+        self.tau_min = tau_min
+        self.tau_max = tau_max
+        self.alpha = alpha
+        self.loss_max = loss_max
+        self.smoothed_loss = None
+
+    def update_threshold(self, current_loss):
+        # Update smoothed loss using EWMA
+        if self.smoothed_loss is None:
+            self.smoothed_loss = current_loss
+        else:
+            self.smoothed_loss = self.alpha * current_loss + (1 - self.alpha) * self.smoothed_loss
+
+        # Scale threshold based on smoothed loss
+        scaled_loss = min(self.smoothed_loss / self.loss_max, 1.0)  # Ensure it's within [0, 1]
+        threshold = self.tau_min + (self.tau_max - self.tau_min) * scaled_loss
+        return threshold
+    
+class thompDQNv2:
+    def __init__(self, task:RLTask, memory_size:int=10000,batch_size=128, gamma=0.99, tau=0.005, rho=0.2, xi=0.2, lr=1e-4, hidden_layers:int=1, hidden_dim:int=128, report_to_optuna:bool=False, trial=None):
+        self.env = gym.make("CartPole-v1")
+        n_observations = self.env.observation_space.shape[0]
+        n_actions = self.env.action_space.n
+
+        self.policy_net = QNetwork(n_observations+2*n_actions, n_actions, hidden_layers=hidden_layers, hidden_dim=hidden_dim, rho=rho, xi=xi).to(device)
+        self.target_net = QNetwork(n_observations+2*n_actions, n_actions, hidden_layers=hidden_layers, hidden_dim=hidden_dim, rho=rho, xi=xi).to(device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.optimizer = optim.AdamW(self.policy_net.parameters(), lr=lr, amsgrad=True)
+        self.optimizer.param_groups[0]['initial_lr'] = lr
+        self.lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=task.size, eta_min=lr/100, last_epoch=task.size)
+        self.memory = ReplayMemory(memory_size)
+        self.steps_done = 0
+
+        self.batch_size = batch_size
+        self.gamma = gamma
+        self.alpha = torch.tensor([1.0 for _ in range(n_actions)], device=self.device, dtype=torch.float)
+        self.beta = torch.tensor([1.0 for _ in range(n_actions)], device=self.device, dtype=torch.float)
+        self.tau = tau
+        self.lr = lr
+
+    def select_action(self, state):
+        self.steps_done += 1
+        with torch.no_grad():
+            # print(state, self.alpha, self.beta)
+            ab_size = self.alpha.sum() + self.beta.sum()
+            actions:torch.Tensor = self.policy_net(torch.cat([state, self.alpha.unsqueeze(0)/ab_size, self.beta.unsqueeze(0)/ab_size], dim=1))
+
+        #if the network is sure about the action, take it, otherwise sample from thompson directly
+        if nn.Softmax(actions).
+
+        return actions.max(1).indices.view(1, 1)
+    
+    def optimize_model(self, return_loss=False):
+        #if we want to return the loss, we do prediction, so just take all the memory for computing the loss
+        if return_loss:
+            transitions = [self.memory.memory.pop() for _ in range(len(self.memory.memory))]
+
+        else: #otherwise in training wait until enough memories, then sample them.
+            if len(self.memory) < self.batch_size:
+                return
+            transitions = self.memory.sample(self.batch_size)
+        # Transpose the batch (see https://stackoverflow.com/a/19343/3343043 for
+        # detailed explanation). This converts
+        # batch-array of Transitions to Transition of batch-arrays.
+        batch = TransitionV2(*zip(*transitions))
+
+        # Compute a mask of non-final states and concatenate the batch elements
+        # (a final state would've been the one after which simulation ended)
+        non_final_mask = torch.tensor(tuple(map(lambda s: s is not None,
+                                                batch.next_state)), device=self.device, dtype=torch.bool)
+        non_final_next_states = torch.cat([s for s in batch.next_state if s is not None])
+        non_final_alpha = torch.cat([a for i,a in enumerate(batch.alpha) if batch.next_state[i] is not None])
+        non_final_beta = torch.cat([b for i,b in enumerate(batch.beta) if batch.next_state[i] is not None])
+
+        state_batch = torch.cat(batch.state)
+        alpha_batch = torch.cat(batch.alpha)
+        beta_batch = torch.cat(batch.beta)
+        action_batch = torch.cat(batch.action)
+        reward_batch = torch.cat(batch.reward)
+
+        # Compute Q(s_t, a) - the model computes Q(s_t), then we select the
+        # columns of actions taken. These are the actions which would've been taken
+        # for each batch state according to policy_net
+        # print(alpha_batch)
+        # print(ab_size)
+        state_action_values = self.policy_net(torch.cat((state_batch, alpha_batch/alpha_batch.sum(dim=1).unsqueeze(1), beta_batch/beta_batch.sum(dim=1).unsqueeze(1)), dim=1)).gather(1, action_batch)
+        
+        # Compute V(s_{t+1}) for all next states.
+        # Expected values of actions for non_final_next_states are computed based
+        # on the "older" target_net; selecting their best reward with max(1).values
+        # This is merged based on the mask, such that we'll have either the expected
+        # state value or 0 in case the state was final.
+        next_state_values = torch.zeros(self.batch_size, device=self.device)
+        with torch.no_grad(): #just use the same alpha beta, as similar enough
+            next_state_values[non_final_mask] = self.target_net(torch.cat((non_final_next_states, non_final_alpha/non_final_alpha.sum(dim=1).unsqueeze(1), non_final_beta/non_final_alpha.sum(dim=1).unsqueeze(1)), dim=1)).max(1).values
+        # Compute the expected Q values
+        expected_state_action_values = (next_state_values * self.gamma) + reward_batch
+
+        # Compute Huber loss
+        criterion = nn.SmoothL1Loss()
+        loss:torch.Tensor = criterion(state_action_values, expected_state_action_values.unsqueeze(1))
+        #if we want to return the loss, do so and not update
+        if return_loss:
+            return loss
+        
+        # Optimize the model
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.entropy_controller.update_threshold(loss.item())
+        #apply the gradfilte
+        # grads = gradfilter_ma(self.policy_net, grads=grads, lamb=5.0, trigger=duration<100) 
+        # grads = gradfilter_ema(self.policy_net, grads=grads, lamb=0.5, alpha=0.8)
+        #alpha...momentum
+        #lamb...amplication factor
+
+        #print the gradient magnitude
+        # print("Gradient magnitude:", self.policy_net.layer1.weight.grad.norm().item(), self.policy_net.layer2.weight.grad.norm().item(), self.policy_net.layer3.weight.grad.norm().item())
+        # In-place gradient clipping
+        torch.nn.utils.clip_grad_value_(self.policy_net.parameters(), 100)
+        self.optimizer.step()
+        self.lr_scheduler.step()
+
+    def train(self):
+        """Train the thompQDNv1 agent for num_episodes episodes"""
+
+        grads = None
+        for i_episode in range(self.num_episodes):
+            # Initialize the environment and get its state
+            state, info = self.env.reset()
+            state = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+            in_done = False
+            for t in count():
+                if in_done:
+                    break
+                action = self.select_action(state)
+                observation, reward, terminated, truncated, _ = self.env.step(action.item())
+                reward = torch.tensor([reward], device=self.device)
+                done = terminated or truncated
+                in_done = done
+
+                if terminated:
+                    next_state = None
+                else:
+                    next_state = torch.tensor(observation, dtype=torch.float32, device=self.device).unsqueeze(0)
+
+                # Store the transition in memory
+                self.memory.push(
+                    state, 
+                    torch.zeros_like(self.alpha.unsqueeze(0)).copy_(self.alpha.unsqueeze(0)), 
+                    torch.zeros_like(self.beta.unsqueeze(0)).copy_(self.beta.unsqueeze(0)), action, next_state, reward)
+
+                # update the alpha and beta values, according to thompson, +1 alpha for reward, +1 beta for no reward
+                # print("This action / reward:", action, reward)
+                if reward > 0:
+                    self.alpha[action] += 1
+                else:
+                    self.beta[action] += 1
+
+                # Move to the next state
+                state = next_state
+
+                # Perform one step of the optimization (on the policy network)
+                self.optimize_model()
+
+                # Soft update of the target network's weights
+                # θ′ ← τ θ + (1 −τ )θ′
+                target_net_state_dict = self.target_net.state_dict()
+                policy_net_state_dict = self.policy_net.state_dict()
+                for key in policy_net_state_dict:
+                    target_net_state_dict[key] = policy_net_state_dict[key]*self.tau + target_net_state_dict[key]*(1-self.tau)
+                self.target_net.load_state_dict(target_net_state_dict)
+
+                if done:
+                    break
+
+
+    def predict(self, num_episodes)->list[float]:
+        """Predict the thompQDNv1 agent for num_episodes episodes until death. Returns the losses of the episodes"""
+        state, info = self.env.reset()
+        state = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+        
+        losses:list[torch.Tensor] = []
+        for i in range(num_episodes):
+            self.memory.memory.clear()
+            in_done = False
+            for t in count():
+                if in_done:
+                    break
+                action = self.select_action(state)
+                observation, reward, terminated, truncated, _ = self.env.step(action.item())
+                reward = torch.tensor([reward], device=self.device)
+                done = terminated or truncated
+                in_done = done
+
+                if terminated:
+                    next_state = None
+                else:
+                    next_state = torch.tensor(observation, dtype=torch.float32, device=self.device).unsqueeze(0)
+
+                # Store the transition in memory
+                self.memory.push(
+                    state, 
+                    torch.zeros_like(self.alpha.unsqueeze(0)).copy_(self.alpha.unsqueeze(0)), 
+                    torch.zeros_like(self.beta.unsqueeze(0)).copy_(self.beta.unsqueeze(0)), action, next_state, reward)
+
+                # update the alpha and beta values, according to thompson, +1 alpha for reward, +1 beta for no reward
+                # print("This action / reward:", action, reward)
+                if reward > 0:
+                    self.alpha[action] += 1
+                else:
+                    self.beta[action] += 1
+
+                # Move to the next state
+                state = next_state
+
+            # compute the loss for the entire memory
+            loss = self.optimize_model(return_loss=True)
+            losses.append(loss)
+
+        return losses
+
 def generate_task(env:gym.Env, episodes:int=10, portion_test:float=0.5)->RLTask:
     return RLTask(env, episodes, portion_test)
 
@@ -107,9 +320,9 @@ MetaUpdateMethod = Literal["reptile", "maml", "mix"]
 class MetaNet():
     def __init__(self, state_dim:int, action_dim:int, hidden_dim:int=64, layers:int=3, 
         meta_lr:float=0.01, meta_min_lr:float=0.0001, num_task_batches:int=1000, 
-        meta_transition_frame:Tuple[int, int]=(50, 80), transition_sigma:float=10.0, reptile_decay:float=0.2,#TODO: how to mix reptile and maml properly
+        meta_transition_frame:Tuple[int, int, int]=(50, 500, 800), transition_sigma:float=10.0, reptile_decay:float=0.2, reptile_factor:float=2.0,#TODO: how to mix reptile and maml properly
         gamma:float=0.99, lossFn:Callable=nn.SmoothL1Loss, inner_lr:float=0.0001, heuristic_update_inner_lr:bool=False, 
-        tau:float=0.001, num_steps:int=500, update_rate:int=8, batch_size:int=32, memory_size:int=10000,
+        tau:float=0.001, num_steps:int=500, update_rate:int=8, batch_size:int=64, memory_size:int=10000,
         initial_alpha=1.0, initial_beta=1.0, useMetaSampling:bool=False,
         inner_grad_clip:float=100.0, meta_grad_clip:float=15.0,
         device="auto"
@@ -130,11 +343,14 @@ class MetaNet():
             The minimum learning rate of the meta-net, used for the CosineAnnealingLR scheduler.
         num_task_batches: int = 1000
             The total number of task batches that are learned. "Just like an episode".
-        meta_transition_frame: Tuple[int, int] = (50, 80)
-            Given (a,b): The number of inner updates `u` done for the meta update to behave like MAML (u<a), like reptile (u>=b), or a smooth transition between the two (a<=u<b). The smooth transition is a sigmoid. #TODO: maybe with linear end pieces
+        meta_transition_frame: Tuple[int, int, int] = (10, 50, 80)
+            Given (m,a,b): The number of inner updates `u` done for the meta update to behave like MAML (u<a), like reptile (u>=b), or a smooth transition between the two (a<=u<b). The smooth transition is a sigmoid. #TODO: maybe with linear end pieces. If u<m, we don't use the task for an update to not have a negative influence on the meta-net.
         transition_sigma: float = 10.0
+            The sigma parameter for the sigmoid transition between MAML and Reptile.
         reptile_decay:float = 0.2
             The rate of the exponential decay applied to reptile updates based on parameter l2-distance.
+        reptile_factor: float = 2.0
+            The factor by which the reptile update is multiplied. This is to balance reptile relative to MAML. The overall update strength should be guided by the meta_lr.
         gamma: float = 0.99
             The discount factor for the q-net rewards.
         lossFn: Callable = nn.SmoothL1Loss
@@ -187,6 +403,7 @@ class MetaNet():
         self.meta_transition_frame = meta_transition_frame
         self.transition_sigma = transition_sigma
         self.reptile_decay = reptile_decay
+        self.reptile_factor = reptile_factor
         
 
         #inner learning params
@@ -270,9 +487,9 @@ class MetaNet():
             state_action_values = self.inner_policy_net(torch.cat([
                 torch.tensor([states]).to(self.device), 
                 torch.tensor([*list(ab.flatten())]).to(self.device)
-            ])).gather(1, actions.unsqueeze(1)).squeeze(1) 
+            ])).gather(1, actions)
         else:
-            state_action_values = self.inner_policy_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+            state_action_values = self.inner_policy_net(states).gather(1, actions)
 
         #==target_q_values
         non_final_mask = torch.tensor(tuple(map(lambda s: s is not None, next_states)), dtype=torch.bool).to(self.device)
@@ -292,11 +509,11 @@ class MetaNet():
         expected_state_action_values = rewards + ((~dones) * self.gamma * next_state_values) 
 
         # compute loss
-        loss = self.lossfn()(state_action_values, expected_state_action_values)
+        loss = self.lossfn()(state_action_values, expected_state_action_values.unsqueeze(1))
 
         #from this part on it's basically https://github.com/AntreasAntoniou/HowToTrainYourMAMLPytorch/blob/master/few_shot_learning_system.py#L83
         self.inner_policy_net.zero_grad()
-        grads = torch.autograd.grad(loss, self.inner_policy_net.parameters(), create_graph=self.use_second_order, allow_unused=True)
+        grads = torch.autograd.grad(loss, self.inner_policy_net.parameters(), create_graph=True, allow_unused=True)
         weights = self.inner_policy_net.state_dict()
 
         grads = tuple(grad.clamp(-self.inner_grad_clip, self.inner_grad_clip) for grad in grads)
@@ -474,6 +691,7 @@ class MetaNet():
                 #store the experience and update sampling and the net if necessary
                 self.memory.append((state, [e for e in self.alpha+self.beta], action, reward, next_state, terminated)) #store the experience
 
+                #TODO: there should be a heuristic for the inner_update_rate to lower it if the episodes die to fast, to enhance learning.
                 #when enough in the memory buffer, and in an update round, make the gradients and possibly update the inner-net 
                 # or during testing, just get the gradients each round.
                 if env_step>=self.batch_size and ((env_step % self.inner_update_rate == 0) or not train):
@@ -482,7 +700,7 @@ class MetaNet():
                         pop_buffer = (
                             env_step - (self.batch_size*env_step/self.inner_update_rate) 
                             > 3*self.batch_size
-                        ), 
+                        ), #maybe we should not pop the buffer?
                         ret_gradient_ptr=ret_gradient_ptr,
                         apply_update=train
                     )
@@ -499,7 +717,7 @@ class MetaNet():
                     break
             
             #show current performance in the environment: the duration of the epsiode
-            print(f"\rCurrent Episode Duration: {duration} / {self.num_steps}", end="")
+            print(f"\rCurrent Episode Duration: {duration} / {self.num_steps}; Num Updates: {len(indiv_losses)}", end="")
                 
 
             env_scores.append(score)
@@ -584,14 +802,15 @@ class MetaNet():
             #if the number of inner updates is less than b of the transition frame, we do a maml update
             #if it is more than a we do a reptile update,
             #if it is in between, we do a sigmoid blend of the two.
+            if len(indiv_test_losses) < self.meta_transition_frame[0]:
+                continue #we don't use the task for the update, as it would probably have a negative effect on the meta-net #TODO we should not need this all tasks should be learnable. (in reality some tasks might also not be learnable and the algorithm should ignore them, but that is a whole different problem. How and when to ignore learning tasks.)
 
-
-            if len(indiv_test_losses) < self.meta_transition_frame[1]:
+            if len(indiv_test_losses) < self.meta_transition_frame[2]:
                 loss_weights = self.compute_importances(indiv_test_losses.size(0))
                 weighted_losses = torch.sum(loss_weights * indiv_test_losses) / len(tasks)
                 weighted_losses.backward()
-                #
-            if len(indiv_test_losses) >= self.meta_transition_frame[0]:
+                
+            if len(indiv_test_losses) >= self.meta_transition_frame[1]:
                 #reptile decay
                 l2_distance = torch.tensor(0.0)
                 for meta_param, inner_param in zip(self.meta_net.parameters(), self.inner_policy_net.parameters()):
@@ -602,14 +821,16 @@ class MetaNet():
                 #compute the soft reptile factor. Is ==1 if only reptile, 0<factor<1 if maml and reptile are blended
                 w_reptile = compute_soft_weight(
                     len(indiv_test_losses), 
-                    self.meta_transition_frame[0], 
                     self.meta_transition_frame[1], 
+                    self.meta_transition_frame[2], 
                     sigma=self.transition_sigma
                 )
 
                 for param, meta_param in zip(self.inner_policy_net.parameters(), self.meta_net.parameters()):
                     #if only reptile this makes the meta_param.grad 0 and only the reptile update remains
                     #if both this blends the two updates
+                    if meta_param.grad is None:
+                        meta_param.grad = torch.zeros_like(meta_param.data, device=self.device)
                     meta_param.grad = (1-w_reptile) * meta_param.grad\
                                     +    w_reptile  * decay_factor * (meta_param.data - param.data / len(tasks))
 
@@ -776,7 +997,7 @@ def run_experiment():
     parser.add_argument("--n_tasks", type=int, default=1000, help="The number of tasks to be generated.")
     parser.add_argument("--use_task_batches", type=bool, default=False, help="Whether to use task batches or not.")
     parser.add_argument("--task_batch_size", type=int, default=10, help="The size of the task batches, only used if use_task_batches is True.")
-    parser.add_argument("--update_method", type=str default="reptile", help="Whether to use second order gradients or not.")
+    parser.add_argument("--update_method", type=str, default="reptile", help="Whether to use second order gradients or not.")
     parser.add_argument("--num_episodes", type=int, default=100, help="The number of episodes to run each environment for.")
     parser.add_argument("--num_steps", type=int, default=500, help="The number of steps to be done in each environment episode.")
     parser.add_argument("--hpt", type=bool, default=False, help="Whether to use hyperparameter tuning or not. All not given, hyperparameters are searched for.")
@@ -794,11 +1015,11 @@ def run_experiment():
             pass
         #run the experiment
         meta_net, train_scores, test_scores = learn_meta_net(
-            env_name=args.env, 
-            n_tasks=args.n_tasks, 
-            episodes=args.num_episodes, 
-            n_steps=args.num_steps, 
-            meta_update_method=args.update_method
+            env_name="CartPole-v1", 
+            # n_tasks=args.n_tasks, 
+            # episodes=args.num_episodes, 
+            # n_steps=args.num_steps, 
+            # meta_update_method=args.update_method
         )
 
         # plot the train and test scores

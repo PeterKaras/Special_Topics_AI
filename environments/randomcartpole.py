@@ -35,7 +35,9 @@ class RandomCartPoleEnv(gym.Env[np.ndarray, Union[int, np.ndarray]]):
         self.random_var = random_vars[0]
         rng = np.random.default_rng(seed if seed != 0 else None)
         def seed()->float: 
-            return self.random_var.rvs(random_state=rng) - 0.5 #The seed is a float in [-0.5,0.5]
+            return 0.5*(self.random_var.rvs(random_state=rng) - 0.5) #The seed is a float in [-0.5,0.5]
+        #TODO: find good prefactor to make our problems manageable/learnable, all environments should be solvable.
+        #maybe we should use qlearners to first find out what environments are solvable (easy and hard) and then run the meta on the distribution
 
         self._sutton_barto_reward = sutton_barto_reward
 
