@@ -1,6 +1,11 @@
+ConfigSpace
+hpbandster
 gymnasium
 numpy
 matplotlib
 torch
 torchvision
 scipy
+joblib
+"ray[tune]"
+wandb
