@@ -6,3 +6,8 @@
 
 /wandb/
 /__pycache__/
+
+/logs/
+/wandb/
+/scripts/
+/jobs/

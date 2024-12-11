@@ -7,5 +7,4 @@ torch
 torchvision
 scipy
 joblib
-"ray[tune]"
 wandb
